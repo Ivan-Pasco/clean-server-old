@@ -90,6 +90,7 @@ pub mod router;
 pub mod runtime_config;
 pub mod server;
 pub mod session;
+pub mod startup_snapshot;
 pub mod wasm;
 pub mod websocket;
 

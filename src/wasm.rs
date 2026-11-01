@@ -254,13 +254,6 @@ pub struct WasmState {
     /// declare any (e.g. older compiler / no v2 plugins loaded). See
     /// `foundation/spec/plugins/contracts/bridge-host-classes.md` §4.
     pub callbacks: Arc<Vec<crate::build_manifest::CallbackContract>>,
-    /// JSON-encoded attribute map for the custom component tag currently
-    /// being dispatched by `_ui_render_page`. Set by the host immediately
-    /// before calling `<tagname>_render` and cleared afterwards so a future
-    /// bridge function (`_ui_component_attrs`) can surface attrs to the
-    /// export. Today's export contract takes no args; this field is the
-    /// hook for the spec's documented attribute-marshaling convention.
-    pub pending_component_attrs: Option<String>,
     /// Bridge function permission gate derived from the `clean:permissions`
     /// custom section of the loaded WASM module.
     pub permission_gate: PermissionGate,
@@ -467,7 +460,6 @@ impl WasmState {
             islands_store: create_shared_islands_store(),
             component_registry: create_shared_component_registry(),
             callbacks: Arc::new(Vec::new()),
-            pending_component_attrs: None,
             permission_gate: PermissionGate::allow_all(),
             limits: build_store_limits(DEFAULT_MEMORY_LIMIT),
             pending_head_links: Vec::new(),
@@ -505,7 +497,6 @@ impl WasmState {
             islands_store: create_shared_islands_store(),
             component_registry: create_shared_component_registry(),
             callbacks: Arc::new(Vec::new()),
-            pending_component_attrs: None,
             permission_gate: PermissionGate::allow_all(),
             limits: build_store_limits(DEFAULT_MEMORY_LIMIT),
             pending_head_links: Vec::new(),
@@ -553,7 +544,6 @@ impl WasmState {
             islands_store,
             component_registry,
             callbacks: Arc::new(Vec::new()),
-            pending_component_attrs: None,
             permission_gate,
             limits: build_store_limits(memory_limit),
             pending_head_links: Vec::new(),
@@ -716,6 +706,17 @@ pub struct WasmInstance {
     permission_gate: PermissionGate,
     /// Memory limit in bytes for each Store
     memory_limit: usize,
+    /// Snapshot exports and data-segment extent of the instrumented module.
+    snapshot_layout: crate::startup_snapshot::InstrumentedModule,
+    /// Instance state captured after the start function ran in `initialize`.
+    /// Restored into every per-request instance so startup state (module
+    /// globals, heap data) is visible to handlers. `None` until initialized.
+    startup_snapshot: parking_lot::RwLock<Option<Arc<crate::startup_snapshot::StartupSnapshot>>>,
+    /// Roles registered via `_roles_register` (shared across all instances so
+    /// a `roles:` block applied at startup is visible to every request).
+    roles_store: SharedRolesStore,
+    /// SMTP configuration set via `_email_configure` (shared across all instances).
+    smtp_state: SharedSmtpState,
     /// Shared WebSocket state (connections, rooms, route registry).
     /// A single instance is shared with the server so bridge functions can
     /// find and update live WebSocket connections.
@@ -855,7 +856,20 @@ impl WasmInstance {
         // structured diagnostic bundle (see `error_reporting`) before
         // surfacing the error so the compiler team can reproduce the
         // bug from the on-disk report.
-        let module = Module::new(&engine, wasm_bytes).map_err(|e| {
+        // Export every module-level mutable global so the post-startup state can
+        // be captured and restored into per-request instances. Malformed bytes
+        // fall through unchanged so wasmtime produces the diagnostic below.
+        let snapshot_layout = crate::startup_snapshot::instrument_module(wasm_bytes)
+            .unwrap_or_else(|e| {
+                debug!("Startup snapshot instrumentation skipped: {}", e);
+                crate::startup_snapshot::InstrumentedModule {
+                    bytes: wasm_bytes.to_vec(),
+                    global_exports: Vec::new(),
+                    data_end: None,
+                }
+            });
+
+        let module = Module::new(&engine, &snapshot_layout.bytes).map_err(|e| {
             let report = WasmParseReport::new(wasm_bytes, &e, module_path);
             let diag_root = error_reporting::diag_dir();
             match report.emit(wasm_bytes, &diag_root) {
@@ -906,6 +920,10 @@ impl WasmInstance {
             callbacks: parking_lot::Mutex::new(Arc::new(Vec::new())),
             permission_gate,
             memory_limit,
+            snapshot_layout,
+            startup_snapshot: parking_lot::RwLock::new(None),
+            roles_store: Arc::new(RwLock::new(RolesStore::new())),
+            smtp_state: create_shared_smtp_state(),
             ws_state: crate::websocket::create_shared_ws_state(),
             jobs_state: crate::jobs::create_shared_jobs_state(),
             locale_state: crate::locale::create_shared_locale_state(),
@@ -921,8 +939,24 @@ impl WasmInstance {
         *self.callbacks.lock() = callbacks;
     }
 
-    /// Create a fresh WASM instance for request handling
+    /// Create a fresh WASM instance for request handling.
+    ///
+    /// The instance is brand new (no state shared with other requests), then
+    /// the post-startup snapshot taken by `initialize` is applied so startup
+    /// state is visible to the handler. See `crate::startup_snapshot`.
     fn create_instance(&self) -> RuntimeResult<(Store<WasmState>, Instance)> {
+        let (mut store, instance) = self.instantiate_fresh()?;
+        let snapshot = self.startup_snapshot.read().clone();
+        if let Some(snapshot) = snapshot {
+            snapshot.restore(&mut store, &instance).map_err(|e| {
+                RuntimeError::wasm(format!("Failed to restore startup state: {}", e))
+            })?;
+        }
+        Ok((store, instance))
+    }
+
+    /// Instantiate the module with only its static initial state.
+    fn instantiate_fresh(&self) -> RuntimeResult<(Store<WasmState>, Instance)> {
         let mut state = WasmState::with_session_store(
             self.router.clone(),
             self.db_bridge.clone(),
@@ -937,6 +971,8 @@ impl WasmInstance {
         state.jobs_state = self.jobs_state.clone();
         state.locale_state = self.locale_state.clone();
         state.runtime_config = self.runtime_config.clone();
+        state.roles_store = self.roles_store.clone();
+        state.smtp_state = self.smtp_state.clone();
         let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.limits);
         // Copy the resolved callback contracts into the fresh state so bridge
@@ -984,7 +1020,7 @@ impl WasmInstance {
     /// Initialize the module (calls main/start function to register routes)
     pub fn initialize(&self) -> RuntimeResult<()> {
         // Create an instance specifically for initialization
-        let (mut store, instance) = self.create_instance()?;
+        let (mut store, instance) = self.instantiate_fresh()?;
 
         // Read __heap_ptr from WASM exports and use it as the authoritative heap start.
         // This avoids hardcoding 65536 and respects the compiler's actual data layout.
@@ -1008,6 +1044,19 @@ impl WasmInstance {
 
                 func.call(&mut store, ())
                     .map_err(|e| RuntimeError::wasm(format!("Failed to call {}: {}", name, e)))?;
+
+                // Capture the post-startup state for per-request instances.
+                let snapshot = crate::startup_snapshot::StartupSnapshot::capture(
+                    &mut store,
+                    &instance,
+                    &self.snapshot_layout,
+                );
+                if snapshot.is_none() {
+                    warn!(
+                        "Module exports no memory; startup state cannot be carried into requests"
+                    );
+                }
+                *self.startup_snapshot.write() = snapshot.map(Arc::new);
 
                 // Run any migrations registered during WASM startup
                 let db = self.db_bridge.clone();
@@ -1311,7 +1360,9 @@ impl WasmInstance {
     pub fn export_names(&self) -> Vec<String> {
         self.module
             .exports()
-            .map(|e| e.name().to_string())
+            .map(|e| e.name())
+            .filter(|name| !name.starts_with(crate::startup_snapshot::SNAPSHOT_GLOBAL_PREFIX))
+            .map(str::to_string)
             .collect()
     }
 

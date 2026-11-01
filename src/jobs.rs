@@ -256,6 +256,9 @@ pub struct JobRecord {
 pub struct CronSchedule {
     /// User-visible name (key in `_schedule_cancel`).
     pub name: String,
+    /// Registration ID returned by `_schedule_cron`; also accepted by
+    /// `_schedule_cancel`.
+    pub id: String,
     /// Cron expression string (e.g. `"*/1 * * * *"`).
     pub cron_expr: String,
     /// WASM export name to call on each tick.
@@ -856,42 +859,57 @@ pub async fn job_result(state: &SharedJobsState, job_id: &str) -> String {
 
 /// Register a named cron schedule.
 ///
-/// Returns `true` on success, `false` if the cron expression is unparseable.
+/// Returns the registration ID (per the `_schedule_cron` contract in
+/// function-registry.toml), or `None` if the name is empty or the cron
+/// expression is unparseable. Registering an existing name replaces the
+/// previous schedule and issues a new ID.
 pub async fn schedule_cron(
     state: &SharedJobsState,
     name: String,
     cron_expr: String,
     handler: String,
-) -> bool {
+) -> Option<String> {
+    if name.is_empty() {
+        warn!("schedule.cron: schedule name must not be empty");
+        return None;
+    }
     if !is_valid_cron(&cron_expr) {
         warn!(
             "schedule.cron: invalid cron expression '{}' for schedule '{}'",
             cron_expr, name
         );
-        return false;
+        return None;
     }
 
+    let id = format!("sched_{}", Uuid::new_v4().simple());
     let schedule = CronSchedule {
         name: name.clone(),
+        id: id.clone(),
         cron_expr,
         handler,
         active: true,
     };
     state.lock().await.schedules.insert(name.clone(), schedule);
-    debug!("schedule.cron: registered '{}'", name);
-    true
+    debug!("schedule.cron: registered '{}' as {}", name, id);
+    Some(id)
 }
 
-/// Cancel a named cron schedule by marking it inactive.
+/// Cancel a cron schedule by marking it inactive.
 ///
-/// Returns `true` if the schedule existed and was active.
-pub async fn schedule_cancel(state: &SharedJobsState, name: &str) -> bool {
+/// `key` is either the schedule name or the registration ID returned by
+/// [`schedule_cron`]. Returns `true` if the schedule existed and was active.
+pub async fn schedule_cancel(state: &SharedJobsState, key: &str) -> bool {
     let mut store = state.lock().await;
-    if let Some(sched) = store.schedules.get_mut(name)
+    let sched = if store.schedules.contains_key(key) {
+        store.schedules.get_mut(key)
+    } else {
+        store.schedules.values_mut().find(|s| s.id == key)
+    };
+    if let Some(sched) = sched
         && sched.active
     {
         sched.active = false;
-        debug!("schedule.cancel: '{}' deactivated", name);
+        debug!("schedule.cancel: '{}' deactivated", sched.name);
         return true;
     }
     false
@@ -1739,14 +1757,17 @@ mod tests {
     async fn test_schedule_cron_and_cancel() {
         let state = create_shared_jobs_state();
 
-        let ok = schedule_cron(
+        let id = schedule_cron(
             &state,
             "dailyDigest".to_string(),
             "0 0 * * *".to_string(),
             "daily_digest_handler".to_string(),
         )
         .await;
-        assert!(ok, "valid cron expression should register");
+        assert!(
+            id.as_deref().is_some_and(|id| !id.is_empty()),
+            "valid cron expression should register and return an ID"
+        );
 
         let cancelled = schedule_cancel(&state, "dailyDigest").await;
         assert!(cancelled, "should cancel an active schedule");
@@ -1756,16 +1777,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_schedule_cancel_by_registration_id() {
+        let state = create_shared_jobs_state();
+        let id = schedule_cron(
+            &state,
+            "hourly".to_string(),
+            "0 * * * *".to_string(),
+            "hourly_handler".to_string(),
+        )
+        .await
+        .expect("valid cron expression should register");
+
+        assert!(
+            schedule_cancel(&state, &id).await,
+            "cancel by ID should succeed"
+        );
+        assert!(
+            !schedule_cancel(&state, &id).await,
+            "second cancel should fail"
+        );
+        assert!(
+            !schedule_cancel(&state, "sched_unknown").await,
+            "unknown ID should not cancel anything"
+        );
+    }
+
+    #[tokio::test]
     async fn test_schedule_invalid_cron_returns_false() {
         let state = create_shared_jobs_state();
-        let ok = schedule_cron(
+        let id = schedule_cron(
             &state,
             "bad".to_string(),
             "not a cron".to_string(),
             "handler".to_string(),
         )
         .await;
-        assert!(!ok, "invalid cron expression should return false");
+        assert!(id.is_none(), "invalid cron expression should not register");
     }
 
     #[test]

@@ -423,6 +423,50 @@ pub async fn start_server(wasm_path: PathBuf, mut config: ServerConfig) -> Runti
         config.effective_memory_limit(),
     )?;
 
+    // Read the build manifest (Plugin Contracts v2 — see contracts/artifacts.md §5).
+    // The manifest sits next to the WASM and tells us where each artifact lives
+    // (`frontend.wasm`, future `theme.css`, etc.). When the manifest is absent
+    // we fall back to legacy CWD/public probing for Phase B compatibility.
+    let main_wasm_dir = wasm_path
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let (resolved_artifacts, manifest_callbacks): (Vec<ResolvedArtifact>, Vec<CallbackContract>) =
+        match BuildManifest::load_alongside(&wasm_path) {
+            Ok(Some(manifest)) => {
+                info!(
+                    "Loaded build manifest (compiler {}, {} artifact(s), {} callback(s))",
+                    manifest.compiler_version,
+                    manifest.artifacts.len(),
+                    manifest.callbacks.len()
+                );
+                (
+                    manifest.resolve_artifacts(&main_wasm_dir),
+                    manifest.callbacks,
+                )
+            }
+            Ok(None) => {
+                debug!(
+                    "No build-manifest.json next to {:?}; using legacy artifact discovery",
+                    wasm_path
+                );
+                (Vec::new(), Vec::new())
+            }
+            Err(e) => {
+                warn!(
+                    "Build manifest present but unreadable; falling back to legacy lookup: {}",
+                    e
+                );
+                (Vec::new(), Vec::new())
+            }
+        };
+    // Install the callbacks on the WASM instance before `_start` runs, so
+    // every store — the initialization store and each fresh request store —
+    // sees them via `WasmState.callbacks`. Bridges like `_ui_render_page`
+    // look them up when they run, at startup or at request time. See
+    // contracts/bridge-host-classes.md §4.
+    wasm.set_callbacks(Arc::new(manifest_callbacks));
+
     // Initialize WASM module (registers routes, static dirs, and runtime config).
     // `server:` block bridges (_http_listen_on, _cors_configure, etc.) run
     // during this call and write into `wasm.runtime_config()`.
@@ -507,47 +551,6 @@ pub async fn start_server(wasm_path: PathBuf, mut config: ServerConfig) -> Runti
     // Load the frame.ui runtime loader.js (plugin installation preferred over embedded stub)
     let loader_js = Arc::new(load_runtime_loader_js());
 
-    // Read the build manifest (Plugin Contracts v2 — see contracts/artifacts.md §5).
-    // The manifest sits next to the WASM and tells us where each artifact lives
-    // (`frontend.wasm`, future `theme.css`, etc.). When the manifest is absent
-    // we fall back to legacy CWD/public probing for Phase B compatibility.
-    let main_wasm_dir = wasm_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
-    let (resolved_artifacts, manifest_callbacks): (Vec<ResolvedArtifact>, Vec<CallbackContract>) =
-        match BuildManifest::load_alongside(&wasm_path) {
-            Ok(Some(manifest)) => {
-                info!(
-                    "Loaded build manifest (compiler {}, {} artifact(s), {} callback(s))",
-                    manifest.compiler_version,
-                    manifest.artifacts.len(),
-                    manifest.callbacks.len()
-                );
-                (
-                    manifest.resolve_artifacts(&main_wasm_dir),
-                    manifest.callbacks,
-                )
-            }
-            Ok(None) => {
-                debug!(
-                    "No build-manifest.json next to {:?}; using legacy artifact discovery",
-                    wasm_path
-                );
-                (Vec::new(), Vec::new())
-            }
-            Err(e) => {
-                warn!(
-                    "Build manifest present but unreadable; falling back to legacy lookup: {}",
-                    e
-                );
-                (Vec::new(), Vec::new())
-            }
-        };
-    // Install the callbacks on the WASM instance so every fresh request-store
-    // sees them via `WasmState.callbacks` — bridges like `_ui_render_page`
-    // look them up at request time. See contracts/bridge-host-classes.md §4.
-    wasm.set_callbacks(Arc::new(manifest_callbacks));
     let frontend_wasm_path: Option<Arc<PathBuf>> = resolved_artifacts
         .iter()
         .find(|a| a.purpose == artifact_purpose::CLIENT_HYDRATION)

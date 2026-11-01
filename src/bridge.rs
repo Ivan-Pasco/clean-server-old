@@ -4290,11 +4290,8 @@ fn resolve_render_export_name(tag_name: &str, pattern: &str) -> String {
     pattern.replace("{tagname}", &normalized)
 }
 
-/// Build a JSON object string from the attributes inside an opening tag.
-/// Used for the prompt's documented attribute-marshaling convention. Stashed
-/// on `WasmState.pending_component_attrs` so a future bridge function can
-/// surface it to the export — today the export receives no args (signature
-/// `() -> i32`) so this is informational only.
+/// Build a JSON object string from the attributes inside an opening tag —
+/// the argument a `component_tag_render` export receives.
 fn marshal_attrs_as_json(opening_tag: &str, tag_name: &str) -> String {
     // Strip `<tag_name` prefix and trailing `>` (or `/>`)
     let after_name = match opening_tag.find(tag_name) {
@@ -4371,8 +4368,9 @@ fn marshal_attrs_as_json(opening_tag: &str, tag_name: &str) -> String {
 /// - Custom = the tag name contains a hyphen (HTML custom-element convention).
 /// - The export name is built from the contract's `export_pattern` (default
 ///   `"{tagname}_render"`) with hyphens stripped from the tag name.
-/// - If the export exists with signature `() -> i32`, call it; the result is
-///   a length-prefixed UTF-8 string pointer (Clean Language string ABI).
+/// - If the export exists with signature `(i32) -> i32`, call it with the
+///   tag's attributes JSON-encoded as a Clean string (length-prefixed
+///   pointer); the result is a length-prefixed UTF-8 string pointer.
 /// - If the export is missing OR has an unexpected signature OR traps, apply
 ///   the contract's `fallback`:
 ///   - `"passthrough"`: leave the original tag in place (default; matches
@@ -4385,10 +4383,9 @@ fn marshal_attrs_as_json(opening_tag: &str, tag_name: &str) -> String {
 /// This is deliberate — multi-pass dispatch invites infinite loops and adds
 /// per-request cost. Future revisions may add a bounded-depth iteration.
 ///
-/// Attribute marshaling: the JSON-encoded attributes are stashed on
-/// `WasmState.pending_component_attrs` for the duration of the call so a
-/// future bridge function (`_ui_component_attrs`) can retrieve them. Today's
-/// export contract takes no args.
+/// Attribute marshaling: the attributes are passed as one JSON object of
+/// attribute name → string value (bridge-host-classes.md §4.1, "call the
+/// matching export with the tag's attributes JSON-encoded").
 fn dispatch_component_tags(
     caller: &mut Caller<'_, WasmState>,
     html: &str,
@@ -4460,14 +4457,13 @@ fn dispatch_component_tags(
         let export_name = resolve_render_export_name(&tag_name, pattern);
         let attrs_json = marshal_attrs_as_json(&opening_tag, &tag_name);
 
-        // Stash attrs for future arg-passing convention; clear afterward so
-        // an unrelated subsequent call doesn't observe stale state.
-        caller.data_mut().pending_component_attrs = Some(attrs_json.clone());
-
         let func_opt = caller.get_export(&export_name).and_then(|e| e.into_func());
         let replacement: Option<String> = match func_opt {
-            Some(func) => match func.typed::<(), i32>(&*caller) {
-                Ok(typed) => match typed.call(&mut *caller, ()) {
+            Some(func) => match func.typed::<i32, i32>(&*caller) {
+                Ok(typed) => match {
+                    let attrs_ptr = write_string_to_caller(caller, &attrs_json);
+                    typed.call(&mut *caller, attrs_ptr)
+                } {
                     Ok(lp_ptr) if lp_ptr > 0 => {
                         host_bridge::read_string_from_caller(caller, lp_ptr)
                     }
@@ -4488,7 +4484,7 @@ fn dispatch_component_tags(
                 },
                 Err(e) => {
                     debug!(
-                        "dispatch_component_tags: export '{}' has unexpected signature (expected `() -> i32`): {}",
+                        "dispatch_component_tags: export '{}' has unexpected signature (expected `(i32) -> i32`): {}",
                         export_name, e
                     );
                     None
@@ -4502,8 +4498,6 @@ fn dispatch_component_tags(
                 None
             }
         };
-
-        caller.data_mut().pending_component_attrs = None;
 
         match replacement {
             Some(rendered) => {
@@ -6595,8 +6589,10 @@ fn register_jobs_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
 
     // -----------------------------------------------------------------------
     // _schedule_cron — register a cron-scheduled handler (no dot alias)
-    // Signature: (name_ptr, name_len, cron_ptr, cron_len, handler_ptr, handler_len) -> i32
-    // Returns 1 on success, 0 if the cron expression is invalid.
+    // Signature: (name_ptr, name_len, cron_ptr, cron_len, handler_ptr, handler_len) -> ptr
+    // Returns a length-prefixed registration ID string, or an empty string when
+    // an argument cannot be read or the cron expression is invalid
+    // (function-registry.toml: returns = "ptr").
     // -----------------------------------------------------------------------
     linker
         .func_wrap(
@@ -6614,21 +6610,21 @@ fn register_jobs_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
                     Some(s) => s,
                     None => {
                         error!("_schedule_cron: failed to read name");
-                        return 0;
+                        return write_string_to_caller(&mut caller, "");
                     }
                 };
                 let cron_expr = match read_raw_string(&mut caller, cron_ptr, cron_len) {
                     Some(s) => s,
                     None => {
                         error!("_schedule_cron: failed to read cron expr");
-                        return 0;
+                        return write_string_to_caller(&mut caller, "");
                     }
                 };
                 let handler = match read_raw_string(&mut caller, handler_ptr, handler_len) {
                     Some(s) => s,
                     None => {
                         error!("_schedule_cron: failed to read handler");
-                        return 0;
+                        return write_string_to_caller(&mut caller, "");
                     }
                 };
 
@@ -6638,7 +6634,7 @@ fn register_jobs_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
                 );
 
                 let jobs_state = caller.data().jobs_state.clone();
-                let ok = tokio::task::block_in_place(|| {
+                let id = tokio::task::block_in_place(|| {
                     tokio::runtime::Handle::current().block_on(jobs::schedule_cron(
                         &jobs_state,
                         name,
@@ -6647,14 +6643,15 @@ fn register_jobs_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
                     ))
                 });
 
-                if ok { 1 } else { 0 }
+                write_string_to_caller(&mut caller, id.as_deref().unwrap_or(""))
             },
         )
         .map_err(|e| RuntimeError::wasm(format!("Failed to define _schedule_cron: {}", e)))?;
 
     // -----------------------------------------------------------------------
-    // _schedule_cancel — cancel a named cron schedule
-    // Signature: (name_ptr, name_len) -> i32  (1 = cancelled, 0 = not found / already inactive)
+    // _schedule_cancel — cancel a cron schedule by name or by the registration
+    // ID returned from _schedule_cron
+    // Signature: (key_ptr, key_len) -> i32  (1 = cancelled, 0 = not found / already inactive)
     // -----------------------------------------------------------------------
     register_bridge_fn!(linker, "_schedule_cancel", |mut caller: Caller<
         '_,

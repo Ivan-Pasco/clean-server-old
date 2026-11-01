@@ -46,6 +46,8 @@ TIER2_FILES=(
   dev_snapshot_bridge_test.rs
   json_v2_bridge_test.rs
   json_conformance.rs
+  startup_state_test.rs
+  schedule_cron_bridge_test.rs
 )
 
 TIER3_FILES=(

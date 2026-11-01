@@ -1,6 +1,6 @@
 [package]
 name = "clean-server"
-version = "1.9.107"
+version = "1.9.108"
 edition = "2024"
 authors = ["Ivan Pasco"]
 license = "MIT OR Apache-2.0"
@@ -56,6 +56,8 @@ futures = "0.3"
 
 # WASM binary parsing (for custom section extraction)
 wasmparser = "0.218"
+# Re-emit the module with snapshot exports for post-startup state restore
+wasm-encoder = "0.218"
 
 # Diagnostic reporting (RUNTIME_WASM_PARSE)
 sha2 = "0.10"

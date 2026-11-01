@@ -241,3 +241,49 @@ fn bridge_covers_registry() {
         "bridge_covers_registry PASSED — all registry entries resolved by the server linker."
     );
 }
+
+/// The server registers no-op stubs for browser-hosted frame.client `_api_*`
+/// bridges so modules that also contain client code (form:/send: blocks)
+/// instantiate on the server. Those stubs must match the compiler-emitted
+/// import exactly, which follows the PluginBridge convention (`integer` →
+/// `i32`) for every registry entry with `browser` in `hosts`.
+#[test]
+fn api_stubs_match_registry_signatures() {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let registry_path = manifest_dir.join("../foundation/spec/platform/function-registry.toml");
+    let toml_str =
+        std::fs::read_to_string(&registry_path).expect("Cannot read function-registry.toml");
+    let registry: Registry =
+        toml::from_str(&toml_str).expect("Failed to parse function-registry.toml");
+
+    let engine = Engine::default();
+    let linker = create_linker(&engine).expect("Failed to create server linker");
+
+    let api_funcs: Vec<&FunctionEntry> = registry
+        .functions
+        .iter()
+        .filter(|f| f.name.starts_with("_api_"))
+        .collect();
+    assert!(
+        !api_funcs.is_empty(),
+        "registry must declare the frame.client _api_* bridges"
+    );
+
+    let mut mismatched: Vec<String> = Vec::new();
+    for func in api_funcs {
+        let conv = convention_for(&func.hosts);
+        let wat = single_import_wat(&func.module, &func.name, &func.params, &func.returns, conv);
+        let module = Module::new(&engine, &wat).expect("generated WAT must be valid");
+        let mut store = make_store(&engine);
+        if let Err(e) = linker.instantiate(&mut store, &module) {
+            mismatched.push(format!("{}::{} — {}", func.module, func.name, e));
+        }
+    }
+
+    assert!(
+        mismatched.is_empty(),
+        "{} _api_* stub(s) do not match function-registry.toml:\n{}",
+        mismatched.len(),
+        mismatched.join("\n")
+    );
+}

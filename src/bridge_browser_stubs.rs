@@ -35,7 +35,7 @@ pub fn register_browser_stubs(linker: &mut Linker<WasmState>) -> RuntimeResult<(
                                 _a1: i32,
                                 _a2: i32,
                                 _a3: i32|
-     -> i64 { 0 });
+     -> i32 { 0 });
     stub!(
         linker,
         "_api_body",
@@ -45,32 +45,32 @@ pub fn register_browser_stubs(linker: &mut Linker<WasmState>) -> RuntimeResult<(
         '_,
         WasmState,
     >|
-     -> i64 { 0 });
+     -> i32 { 0 });
     stub!(linker, "_api_delete", |_caller: Caller<'_, WasmState>,
                                   _a0: i32,
                                   _a1: i32,
                                   _a2: i32,
                                   _a3: i32|
-     -> i64 { 0 });
+     -> i32 { 0 });
     stub!(linker, "_api_get", |_caller: Caller<'_, WasmState>,
                                _a0: i32,
                                _a1: i32,
                                _a2: i32,
                                _a3: i32|
-     -> i64 { 0 });
+     -> i32 { 0 });
     stub!(linker, "_api_header", |_caller: Caller<'_, WasmState>,
                                   _a0: i32,
                                   _a1: i32,
                                   _a2: i32,
                                   _a3: i32|
-     -> i64 { 0 });
+     -> i32 { 0 });
     stub!(linker, "_api_json", |mut caller: Caller<'_, WasmState>,
                                 _a0: i32,
                                 _a1: i32|
      -> i32 {
         write_string_to_caller(&mut caller, "")
     });
-    stub!(linker, "_api_ok", |_caller: Caller<'_, WasmState>| -> i64 {
+    stub!(linker, "_api_ok", |_caller: Caller<'_, WasmState>| -> i32 {
         0
     });
     stub!(linker, "_api_patch", |_caller: Caller<'_, WasmState>,
@@ -80,7 +80,7 @@ pub fn register_browser_stubs(linker: &mut Linker<WasmState>) -> RuntimeResult<(
                                  _a3: i32,
                                  _a4: i32,
                                  _a5: i32|
-     -> i64 { 0 });
+     -> i32 { 0 });
     stub!(linker, "_api_post", |_caller: Caller<'_, WasmState>,
                                 _a0: i32,
                                 _a1: i32,
@@ -88,7 +88,7 @@ pub fn register_browser_stubs(linker: &mut Linker<WasmState>) -> RuntimeResult<(
                                 _a3: i32,
                                 _a4: i32,
                                 _a5: i32|
-     -> i64 { 0 });
+     -> i32 { 0 });
     stub!(linker, "_api_put", |_caller: Caller<'_, WasmState>,
                                _a0: i32,
                                _a1: i32,
@@ -96,7 +96,7 @@ pub fn register_browser_stubs(linker: &mut Linker<WasmState>) -> RuntimeResult<(
                                _a3: i32,
                                _a4: i32,
                                _a5: i32|
-     -> i64 { 0 });
+     -> i32 { 0 });
     stub!(linker, "_api_responseHeader", |mut caller: Caller<
         '_,
         WasmState,
@@ -109,7 +109,7 @@ pub fn register_browser_stubs(linker: &mut Linker<WasmState>) -> RuntimeResult<(
     stub!(
         linker,
         "_api_status",
-        |_caller: Caller<'_, WasmState>| -> i64 { 0 }
+        |_caller: Caller<'_, WasmState>| -> i32 { 0 }
     );
     stub!(linker, "_api_submit", |_caller: Caller<'_, WasmState>,
                                   _a0: i32,
@@ -120,10 +120,10 @@ pub fn register_browser_stubs(linker: &mut Linker<WasmState>) -> RuntimeResult<(
                                   _a5: i32,
                                   _a6: i32,
                                   _a7: i32|
-     -> i64 { 0 });
+     -> i32 { 0 });
     stub!(linker, "_api_timeout", |_caller: Caller<'_, WasmState>,
-                                   _a0: i64|
-     -> i64 { 0 });
+                                   _a0: i32|
+     -> i32 { 0 });
 
     // ===== category: console (7 fns) =====
     stub!(linker, "_assert", |_caller: Caller<'_, WasmState>,

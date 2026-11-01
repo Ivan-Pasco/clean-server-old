@@ -509,7 +509,7 @@ checksum = "a1d728cc89cf3aee9ff92b05e62b19ee65a02b5702cff7d5a377e32c6ae29d8d"
 
 [[package]]
 name = "clean-server"
-version = "1.9.107"
+version = "1.9.108"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -543,6 +543,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "uuid",
+ "wasm-encoder 0.218.1",
  "wasmparser 0.218.1",
  "wasmtime",
  "wat",

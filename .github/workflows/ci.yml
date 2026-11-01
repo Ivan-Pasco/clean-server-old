@@ -121,6 +121,8 @@ jobs:
           - http_bridge_defaults_test
           - jobs_persistence_test
           - wasm_alignment_test
+          - startup_state_test
+          - schedule_cron_bridge_test
     steps:
       - uses: actions/checkout@v4
 
