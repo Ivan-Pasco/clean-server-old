@@ -195,7 +195,7 @@ jobs:
         continue-on-error: true
         uses: actions/checkout@v4
         with:
-          repository: Ivan-Pasco/clean-framework
+          repository: Ivan-Pasco/cleen-framework-old
           path: clean-framework
           sparse-checkout: |
             plugins/frame.canvas/plugin.toml
