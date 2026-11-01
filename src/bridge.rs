@@ -4460,28 +4460,29 @@ fn dispatch_component_tags(
         let func_opt = caller.get_export(&export_name).and_then(|e| e.into_func());
         let replacement: Option<String> = match func_opt {
             Some(func) => match func.typed::<i32, i32>(&*caller) {
-                Ok(typed) => match {
+                Ok(typed) => {
                     let attrs_ptr = write_string_to_caller(caller, &attrs_json);
-                    typed.call(&mut *caller, attrs_ptr)
-                } {
-                    Ok(lp_ptr) if lp_ptr > 0 => {
-                        host_bridge::read_string_from_caller(caller, lp_ptr)
+                    let call_result = typed.call(&mut *caller, attrs_ptr);
+                    match call_result {
+                        Ok(lp_ptr) if lp_ptr > 0 => {
+                            host_bridge::read_string_from_caller(caller, lp_ptr)
+                        }
+                        Ok(lp_ptr) => {
+                            debug!(
+                                "dispatch_component_tags: export '{}' returned invalid pointer {}",
+                                export_name, lp_ptr
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            error!(
+                                "dispatch_component_tags: export '{}' trapped: {}",
+                                export_name, e
+                            );
+                            None
+                        }
                     }
-                    Ok(lp_ptr) => {
-                        debug!(
-                            "dispatch_component_tags: export '{}' returned invalid pointer {}",
-                            export_name, lp_ptr
-                        );
-                        None
-                    }
-                    Err(e) => {
-                        error!(
-                            "dispatch_component_tags: export '{}' trapped: {}",
-                            export_name, e
-                        );
-                        None
-                    }
-                },
+                }
                 Err(e) => {
                     debug!(
                         "dispatch_component_tags: export '{}' has unexpected signature (expected `(i32) -> i32`): {}",
