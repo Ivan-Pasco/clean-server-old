@@ -2622,6 +2622,21 @@ fn replace_cookie_max_age(cookie: &str, ttl_seconds: u64) -> String {
     }
 }
 
+/// Clean strings are UTF-8, so a text body is always UTF-8. A text content
+/// type without a charset (`http.respond(200, "text/html", page)`) gets
+/// `charset=utf-8`; otherwise browsers read the page as windows-1252 unless it
+/// has a `<meta charset>`, and "·" shows as "Â·".
+fn with_utf8_charset(content_type: &str) -> String {
+    let trimmed = content_type.trim();
+    let is_text = trimmed.to_ascii_lowercase().starts_with("text/");
+    let has_charset = trimmed.to_ascii_lowercase().contains("charset=");
+    if is_text && !has_charset {
+        format!("{}; charset=utf-8", trimmed.trim_end_matches(';'))
+    } else {
+        content_type.to_string()
+    }
+}
+
 /// Register response manipulation functions (_res_set_header, _res_redirect)
 fn register_response_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> {
     // _http_respond - Send an HTTP response with status, content type, and body
@@ -2652,7 +2667,7 @@ fn register_response_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<
                 // Set response properties
                 let state = caller.data_mut();
                 state.set_status(status as u16);
-                state.add_header("Content-Type".to_string(), content_type);
+                state.add_header("Content-Type".to_string(), with_utf8_charset(&content_type));
                 state.set_body(body.clone());
 
                 // Return pointer to body for chaining
@@ -7183,6 +7198,16 @@ fn register_dot_aliases(linker: &mut Linker<WasmState>) -> RuntimeResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_responses_say_they_are_utf8() {
+        assert_eq!(with_utf8_charset("text/html"), "text/html; charset=utf-8");
+        assert_eq!(with_utf8_charset("text/plain;"), "text/plain; charset=utf-8");
+        assert_eq!(with_utf8_charset("text/html; charset=iso-8859-1"), "text/html; charset=iso-8859-1");
+        assert_eq!(with_utf8_charset("Text/CSS; Charset=UTF-8"), "Text/CSS; Charset=UTF-8");
+        assert_eq!(with_utf8_charset("application/json"), "application/json");
+        assert_eq!(with_utf8_charset("image/png"), "image/png");
+    }
 
     fn write_layout(dir: &std::path::Path, rel: &str, body: &str) {
         let full = dir.join(rel);
