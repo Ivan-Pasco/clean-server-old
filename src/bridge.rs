@@ -7202,9 +7202,18 @@ mod tests {
     #[test]
     fn text_responses_say_they_are_utf8() {
         assert_eq!(with_utf8_charset("text/html"), "text/html; charset=utf-8");
-        assert_eq!(with_utf8_charset("text/plain;"), "text/plain; charset=utf-8");
-        assert_eq!(with_utf8_charset("text/html; charset=iso-8859-1"), "text/html; charset=iso-8859-1");
-        assert_eq!(with_utf8_charset("Text/CSS; Charset=UTF-8"), "Text/CSS; Charset=UTF-8");
+        assert_eq!(
+            with_utf8_charset("text/plain;"),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(
+            with_utf8_charset("text/html; charset=iso-8859-1"),
+            "text/html; charset=iso-8859-1"
+        );
+        assert_eq!(
+            with_utf8_charset("Text/CSS; Charset=UTF-8"),
+            "Text/CSS; Charset=UTF-8"
+        );
         assert_eq!(with_utf8_charset("application/json"), "application/json");
         assert_eq!(with_utf8_charset("image/png"), "image/png");
     }
