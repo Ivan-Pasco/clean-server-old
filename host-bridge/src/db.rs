@@ -1043,11 +1043,7 @@ impl DbBridge {
         };
 
         // Validate SQL
-        let sql_upper = req.sql.trim().to_uppercase();
-        let valid_commands = [
-            "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE",
-        ];
-        let is_valid = valid_commands.iter().any(|cmd| sql_upper.starts_with(cmd));
+        let is_valid = is_write_statement(&req.sql);
 
         if !is_valid {
             return Ok(json!({
@@ -1416,11 +1412,7 @@ impl DbBridge {
             }
         };
 
-        let sql_upper = req.sql.trim().to_uppercase();
-        let valid_commands = [
-            "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE",
-        ];
-        let is_valid = valid_commands.iter().any(|cmd| sql_upper.starts_with(cmd));
+        let is_valid = is_write_statement(&req.sql);
 
         if !is_valid {
             return Ok(json!({
@@ -2308,6 +2300,73 @@ fn compute_migration_diff(table: Option<&str>, declared: &Value, live: &Value) -
     format!("ALTER TABLE {} {};", tbl, add_clauses.join(", "))
 }
 
+/// Statements `execute()` runs: the ones that change data or schema. A
+/// statement that starts with a `WITH` clause is judged by the statement
+/// after it, so `WITH moved AS (UPDATE ...) INSERT INTO ...` is a write
+/// while `WITH t AS (...) SELECT ...` still belongs to `query()`.
+fn is_write_statement(sql: &str) -> bool {
+    const WRITES: [&str; 7] = ["INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE"];
+    let upper = sql.trim().to_uppercase();
+    let main = if starts_with_keyword(&upper, "WITH") {
+        statement_after_with(&upper)
+    } else {
+        upper.as_str()
+    };
+    WRITES.iter().any(|w| starts_with_keyword(main, w))
+}
+
+fn starts_with_keyword(s: &str, keyword: &str) -> bool {
+    s.starts_with(keyword)
+        && !s[keyword.len()..]
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_alphanumeric() || c == '_')
+            .unwrap_or(false)
+}
+
+/// The text after a leading `WITH` clause: every common table expression is
+/// `name [(columns)] AS [NOT] [MATERIALIZED] ( ... )`, separated by commas.
+/// The main statement starts at the first word outside parentheses that
+/// follows a closed CTE body and is not a comma. Quoted text is skipped.
+fn statement_after_with(upper: &str) -> &str {
+    let bytes = upper.as_bytes();
+    let mut depth = 0usize;
+    let mut closed_body = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        match c {
+            b'\'' | b'"' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != c {
+                    i += 1;
+                }
+            }
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    closed_body = true;
+                }
+            }
+            b',' if depth == 0 => closed_body = false,
+            c if depth == 0 && closed_body && c.is_ascii_alphabetic() => {
+                let rest = &upper[i..];
+                // A column list `name (a, b) AS (...)` closes a paren too;
+                // the CTE body only ends at the parenthesis after AS.
+                if starts_with_keyword(rest, "AS") {
+                    closed_body = false;
+                } else {
+                    return rest;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    ""
+}
+
 // ============================================================================
 // TESTS
 // ============================================================================
@@ -2320,6 +2379,41 @@ mod tests {
 
     static TEST_DB_MUTEX: once_cell::sync::Lazy<Arc<AsyncMutex<()>>> =
         once_cell::sync::Lazy::new(|| Arc::new(AsyncMutex::new(())));
+
+    #[test]
+    fn write_statements_include_ctes_that_end_in_a_write() {
+        assert!(is_write_statement("INSERT INTO t (x) VALUES (1)"));
+        assert!(is_write_statement("  update t set x = 1"));
+        assert!(is_write_statement(
+            "WITH u AS (UPDATE products SET quantity = quantity - $2::integer WHERE id = $1::integer AND quantity >= $2::integer RETURNING id) INSERT INTO stock_movements (product_id, direction, amount) SELECT id, 'out', $2::integer FROM u"
+        ));
+        assert!(is_write_statement("WITH a (n) AS (SELECT 1), b AS MATERIALIZED (SELECT ')' AS p) DELETE FROM t WHERE x IN (SELECT n FROM a)"));
+        assert!(is_write_statement("WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 3) INSERT INTO t (x) SELECT n FROM r"));
+    }
+
+    #[test]
+    fn reads_are_not_write_statements() {
+        assert!(!is_write_statement("SELECT * FROM t"));
+        assert!(!is_write_statement("WITH t AS (SELECT 1 AS x) SELECT x FROM t"));
+        assert!(!is_write_statement("WITH u AS (UPDATE t SET x = 1 RETURNING x) SELECT x FROM u"));
+        assert!(!is_write_statement("WITH"));
+        assert!(!is_write_statement("INSERTS"));
+        assert!(!is_write_statement("WITHDRAW"));
+    }
+
+    #[tokio::test]
+    async fn execute_runs_a_statement_with_a_cte() {
+        let (bridge, _guard) = setup_test_db().await;
+        let result = bridge
+            .execute(json!({
+                "sql": "WITH n AS (SELECT 'from cte' AS v) INSERT INTO users (name, email) SELECT v, 'cte@example.test' FROM n",
+                "params": []
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(result["data"]["affected_rows"], 1, "{result}");
+    }
 
     async fn setup_test_db() -> (DbBridge, tokio::sync::MutexGuard<'static, ()>) {
         let guard = TEST_DB_MUTEX.lock().await;
