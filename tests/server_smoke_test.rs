@@ -105,6 +105,7 @@ fn server_boots_serves_and_shuts_down() {
 
     if !connected {
         let _ = child.kill();
+        let _ = child.wait();
         let out = std::fs::read_to_string(&stdout_log).unwrap_or_default();
         let err = std::fs::read_to_string(&stderr_log).unwrap_or_default();
         panic!(
@@ -134,23 +135,19 @@ fn server_boots_serves_and_shuts_down() {
         })
     });
 
-    // Regardless of how HTTP went, shut the server down cleanly.
+    // Regardless of how HTTP went, shut the server down cleanly: it must
+    // exit within 2 seconds of the kill. The process is reaped either way.
     let _ = child.kill();
     let shutdown_deadline = Instant::now() + Duration::from_secs(2);
     let mut exited_cleanly = false;
     while Instant::now() < shutdown_deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                exited_cleanly = true;
-                break;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(e) => panic!("server_smoke_test: try_wait failed: {e}"),
+        if let Ok(Some(_)) = child.try_wait() {
+            exited_cleanly = true;
+            break;
         }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    if !exited_cleanly {
-        let _ = child.wait();
-    }
+    let _ = child.wait();
 
     // Now surface HTTP-side failures.
     match http_result {

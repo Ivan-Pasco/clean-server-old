@@ -166,8 +166,8 @@ fn sha256_of_gzip_shaped_payload() {
     gz[0] = 0x1f;
     gz[1] = 0x8b;
     gz[2] = 0x08;
-    for i in 3..gz.len() {
-        gz[i] = ((i * 37) & 0xff) as u8;
+    for (i, byte) in gz.iter_mut().enumerate().skip(3) {
+        *byte = ((i * 37) & 0xff) as u8;
     }
     let expected = hex::encode(Sha256::digest(&gz));
 

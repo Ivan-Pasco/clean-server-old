@@ -294,12 +294,12 @@ fn find_cln_compiler() -> Option<PathBuf> {
     }
 
     // Fall back to PATH resolution.
-    if let Ok(output) = Command::new("which").arg("cln").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Some(PathBuf::from(path));
-            }
+    if let Ok(output) = Command::new("which").arg("cln").output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
         }
     }
 
@@ -890,5 +890,175 @@ fn test_json_get_tolerates_bare_lp_string_source() {
         "_json_get returned {} as first byte, expected 'h' (104). The fallback \
          resolved to a value but not the expected 'hello'.",
         first_byte
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test: _json_get walks an already-decoded boxed-Any tree.
+//
+// The compiler lowers every `json.get(data, path)` to `_json_get`
+// (stdlib-reference §8), including `json.get(json.decode(text), path)`
+// where the source is a JSON-tree object (tag 6, BOXED_ANY_ABI §3.3)
+// rather than a string. For such a source `_json_get` returns the leaf as
+// a typed boxed-Any (tag 1 for an integer, tag 4 for a string, ...) and a
+// null-tag box when the path does not resolve (runtime-abi/v1.toml).
+// A string source keeps its established result — the leaf as text, ""
+// on a miss — which binaries already deployed depend on.
+// ---------------------------------------------------------------------------
+
+const JSON_GET_TREE_WAT: &str = r#"
+(module
+  (import "env" "_json_decode_v2" (func $decode (param i32 i32) (result i32)))
+  (import "env" "_json_get" (func $json_get (param i32 i32) (result i32)))
+  (memory (export "memory") 2)
+  (global $heap (mut i32) (i32.const 8192))
+  (export "__heap_ptr" (global $heap))
+
+  (func $malloc (export "malloc") (param $size i32) (result i32)
+    (local $ptr i32)
+    (local.set $ptr (global.get $heap))
+    (global.set $heap
+      (i32.and (i32.add (i32.add (global.get $heap) (local.get $size)) (i32.const 7))
+               (i32.const -8)))
+    (local.get $ptr))
+
+  ;; {"user":{"age":42,"name":"Ann","nick":null},"tags":["a","b"]} (61 bytes)
+  (data (i32.const 1024)
+    "{\22user\22:{\22age\22:42,\22name\22:\22Ann\22,\22nick\22:null},\22tags\22:[\22a\22,\22b\22]}")
+  ;; LP paths: [len][bytes]
+  (data (i32.const 2048) "\08\00\00\00user.age")
+  (data (i32.const 2080) "\09\00\00\00user.name")
+  (data (i32.const 2112) "\06\00\00\00tags.1")
+  (data (i32.const 2144) "\0c\00\00\00user.missing")
+  (data (i32.const 2176) "\09\00\00\00user.nick")
+  ;; LP string holding the same JSON text, for the string-source case.
+  (data (i32.const 3072) "\3d\00\00\00")
+  (data (i32.const 3076)
+    "{\22user\22:{\22age\22:42,\22name\22:\22Ann\22,\22nick\22:null},\22tags\22:[\22a\22,\22b\22]}")
+
+  ;; _json_get on the decoded tree; returns the result box.
+  (func (export "get_from_tree") (param $path i32) (result i32)
+    (call $json_get (call $decode (i32.const 1024) (i32.const 61)) (local.get $path)))
+
+  ;; _json_get on a String-tagged box holding the JSON text.
+  (func (export "get_from_text") (param $path i32) (result i32)
+    (local $box i32)
+    (local.set $box (call $malloc (i32.const 12)))
+    (i32.store (local.get $box) (i32.const 4))
+    (i32.store offset=4 (local.get $box) (i32.const 3072))
+    (i32.store offset=8 (local.get $box) (i32.const 0))
+    (call $json_get (local.get $box) (local.get $path)))
+)
+"#;
+
+struct JsonGetHarness {
+    store: Store<WasmState>,
+    instance: wasmtime::Instance,
+}
+
+impl JsonGetHarness {
+    fn new() -> Self {
+        let engine = Engine::default();
+        let module = Module::new(&engine, JSON_GET_TREE_WAT).expect("compile WAT");
+        let linker = create_linker(&engine).expect("create linker");
+        let mut store = make_store(&engine);
+        let instance = linker
+            .instantiate(&mut store, &module)
+            .expect("instantiate module");
+        Self { store, instance }
+    }
+
+    fn call(&mut self, export: &str, path: i32) -> i32 {
+        self.instance
+            .get_typed_func::<i32, i32>(&mut self.store, export)
+            .expect("export")
+            .call(&mut self.store, path)
+            .expect("call _json_get")
+    }
+
+    fn memory(&mut self) -> wasmtime::Memory {
+        self.instance
+            .get_memory(&mut self.store, "memory")
+            .expect("memory")
+    }
+
+    fn i32_at(&mut self, ptr: i32) -> i32 {
+        let memory = self.memory();
+        let mut bytes = [0u8; 4];
+        memory
+            .read(&self.store, ptr as usize, &mut bytes)
+            .expect("read i32");
+        i32::from_le_bytes(bytes)
+    }
+
+    fn i64_at(&mut self, ptr: i32) -> i64 {
+        let memory = self.memory();
+        let mut bytes = [0u8; 8];
+        memory
+            .read(&self.store, ptr as usize, &mut bytes)
+            .expect("read i64");
+        i64::from_le_bytes(bytes)
+    }
+
+    fn lp_string_at(&mut self, ptr: i32) -> String {
+        let len = self.i32_at(ptr) as usize;
+        let memory = self.memory();
+        let mut bytes = vec![0u8; len];
+        memory
+            .read(&self.store, ptr as usize + 4, &mut bytes)
+            .expect("read string");
+        String::from_utf8(bytes).expect("utf-8")
+    }
+}
+
+#[test]
+fn test_json_get_on_decoded_tree_returns_typed_leaf() {
+    let mut h = JsonGetHarness::new();
+
+    let age = h.call("get_from_tree", 2048);
+    assert_eq!(h.i32_at(age), 1, "user.age must be an integer box (tag 1)");
+    assert_eq!(h.i64_at(age + 4), 42);
+
+    let name = h.call("get_from_tree", 2080);
+    assert_eq!(h.i32_at(name), 4, "user.name must be a string box (tag 4)");
+    let name_ptr = h.i32_at(name + 4);
+    assert_eq!(h.lp_string_at(name_ptr), "Ann");
+
+    let tag = h.call("get_from_tree", 2112);
+    assert_eq!(h.i32_at(tag), 4, "tags.1 must be a string box (tag 4)");
+    let tag_ptr = h.i32_at(tag + 4);
+    assert_eq!(h.lp_string_at(tag_ptr), "b");
+}
+
+#[test]
+fn test_json_get_on_decoded_tree_miss_is_null_tag() {
+    let mut h = JsonGetHarness::new();
+    for path in [2144, 2176] {
+        let result = h.call("get_from_tree", path);
+        assert_ne!(result, 0, "_json_get must return a box, not a null pointer");
+        assert_eq!(
+            h.i32_at(result),
+            0,
+            "a missing path or a JSON null must be a null-tag box (tag 0)"
+        );
+    }
+}
+
+#[test]
+fn test_json_get_on_text_keeps_text_leaf() {
+    let mut h = JsonGetHarness::new();
+
+    let age = h.call("get_from_text", 2048);
+    assert_eq!(h.i32_at(age), 4, "a string source yields the leaf as text");
+    let age_ptr = h.i32_at(age + 4);
+    assert_eq!(h.lp_string_at(age_ptr), "42");
+
+    let missing = h.call("get_from_text", 2144);
+    assert_eq!(h.i32_at(missing), 4);
+    let missing_ptr = h.i32_at(missing + 4);
+    assert_eq!(
+        h.lp_string_at(missing_ptr),
+        "",
+        "a miss on a string source is \"\""
     );
 }

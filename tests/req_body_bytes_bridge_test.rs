@@ -194,8 +194,8 @@ fn preserves_gzip_magic_and_tar_gz_shaped_payload() {
     gz[0] = 0x1f;
     gz[1] = 0x8b;
     gz[2] = 0x08;
-    for i in 3..gz.len() {
-        gz[i] = ((i * 37) & 0xff) as u8;
+    for (i, byte) in gz.iter_mut().enumerate().skip(3) {
+        *byte = ((i * 37) & 0xff) as u8;
     }
     h.set_body_bytes(gz.clone());
     let (_ptr, out) = h.invoke_and_read();

@@ -131,12 +131,12 @@ fn find_cln_compiler() -> Result<PathBuf, String> {
     }
 
     // Try PATH
-    if let Ok(output) = Command::new("which").arg("cln").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Ok(PathBuf::from(path));
-            }
+    if let Ok(output) = Command::new("which").arg("cln").output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
         }
     }
 

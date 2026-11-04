@@ -210,8 +210,8 @@ fn test_json_encode_v2_integer() {
 #[test]
 fn test_json_encode_v2_number() {
     let mut h = H::new();
-    let boxed = h.alloc_boxed_f64(3.14);
-    assert_eq!(h.encode(boxed), "3.14");
+    let boxed = h.alloc_boxed_f64(2.75);
+    assert_eq!(h.encode(boxed), "2.75");
 }
 
 #[test]
@@ -347,11 +347,11 @@ fn test_json_decode_v2_integer() {
 #[test]
 fn test_json_decode_v2_number() {
     let mut h = H::new();
-    let ptr = h.decode("3.14");
+    let ptr = h.decode("2.75");
     assert_eq!(h.read_i32(ptr as usize), 3);
     let bytes = h.mem_read(ptr as usize + 4, 8);
     let f = f64::from_le_bytes(bytes.try_into().unwrap());
-    assert!((f - 3.14).abs() < 1e-9);
+    assert!((f - 2.75).abs() < 1e-9);
 }
 
 #[test]

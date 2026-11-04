@@ -3222,7 +3222,11 @@ fn register_json_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
     //   - tag=4 (String):  value1 is a length-prefixed string pointer holding
     //                       the JSON payload (the case from `json.get("{}", k)`
     //                       and from `_db_query` results boxed as Any-string).
-    //   - tag=0 (Null):    the source was null — return a null-boxed Any.
+    //   - tag=0 (Null):    the source was null — return "" boxed as String.
+    //   - tags 1/2/3/5/6:  an already-decoded value (`json.get(json.decode(t),
+    //                       path)`). The tree is walked and the leaf returned
+    //                       as a typed boxed-Any, null-tag on a miss — see
+    //                       `json_get_from_tree`.
     //   - other tags:      treat value1 as an lp-str pointer as a best-effort
     //                       fallback so the runtime does not trap on unfamiliar
     //                       shapes. Parse failures return "" boxed as String.
@@ -3274,6 +3278,20 @@ fn register_json_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
                 if tag == 0 {
                     debug!("_json_get: source is Null-boxed, returning empty");
                     return write_boxed_any_string(&mut caller, "");
+                }
+
+                // An already-decoded value (array, object or scalar box —
+                // e.g. `json.get(json.decode(text), path)`): walk the tree
+                // and return the leaf as a typed boxed-Any, or a null-tag
+                // box when the path does not resolve (runtime-abi/v1.toml).
+                // Only the compiler's JSON lowering produces these sources,
+                // so no deployed binary depends on another shape.
+                // A source that does not read as a tree falls through to the
+                // string handling below (the bare lp-string fallback).
+                if matches!(tag, 1 | 2 | 3 | 5 | 6)
+                    && let Ok(tree) = read_boxed_any_recursive(&mut caller, any_ptr)
+                {
+                    return json_get_from_tree(&mut caller, &tree, path_ptr);
                 }
 
                 let boxed_str = read_string_from_caller(&mut caller, value1);
@@ -3434,6 +3452,39 @@ fn register_json_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
         .map_err(|e| RuntimeError::wasm(format!("Failed to define _json_decode_v2: {}", e)))?;
 
     Ok(())
+}
+
+/// `_json_get` on a decoded boxed-Any tree: the value at the dot-separated
+/// LP path `path_ptr` as a typed boxed-Any, or a null-tag box when the path
+/// does not resolve.
+fn json_get_from_tree(
+    caller: &mut Caller<'_, WasmState>,
+    tree: &serde_json::Value,
+    path_ptr: i32,
+) -> i32 {
+    let path = read_lp_string(caller, path_ptr).unwrap_or_default();
+    let leaf = json_get_by_path(tree, &path).unwrap_or(&serde_json::Value::Null);
+    match write_boxed_any_recursive(caller, leaf) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("_json_get: allocation failure: {}", e);
+            0
+        }
+    }
+}
+
+/// Follow a dot-separated path through a JSON value. A segment selects an
+/// object member by name, or an array element when it is a decimal index.
+fn json_get_by_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    path.split('.')
+        .try_fold(value, |current, segment| match current {
+            serde_json::Value::Object(map) => map.get(segment),
+            serde_json::Value::Array(items) => segment
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| items.get(index)),
+            _ => None,
+        })
 }
 
 // ============================================================================
