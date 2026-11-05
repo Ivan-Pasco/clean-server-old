@@ -45,13 +45,15 @@ struct Args {
     #[arg(value_name = "WASM_FILE", required = true)]
     wasm_path: Option<PathBuf>,
 
-    /// Port to listen on
-    #[arg(short, long, default_value = "3000")]
-    port: u16,
+    /// Port to listen on [default: the module's `server: port:`, else 3000].
+    /// An explicit port overrides the module's declaration.
+    #[arg(short, long)]
+    port: Option<u16>,
 
-    /// Host address to bind to
-    #[arg(long, default_value = "0.0.0.0")]
-    host: String,
+    /// Host address to bind to [default: the module's `server: host:`, else 0.0.0.0].
+    /// An explicit host overrides the module's declaration.
+    #[arg(long)]
+    host: Option<String>,
 
     /// Enable verbose logging
     #[arg(short, long)]
@@ -148,6 +150,9 @@ async fn main() {
         .with_thread_ids(false)
         .with_file(false)
         .with_line_number(false)
+        // Logs go to stderr: stdout belongs to the application (its print
+        // output, and the JSON-RPC stream of a stdio MCP server).
+        .with_writer(std::io::stderr)
         .compact()
         .with_filter(tracing_subscriber::filter::LevelFilter::from(log_level));
     Registry::default()
@@ -172,15 +177,15 @@ async fn main() {
 }
 
 async fn run_server_command(args: Args) -> Result<(), i32> {
-    println!();
-    println!("  ╔═══════════════════════════════════════════╗");
-    println!(
+    eprintln!();
+    eprintln!("  ╔═══════════════════════════════════════════╗");
+    eprintln!(
         "  ║         Clean Server v{}            ║",
         env!("CARGO_PKG_VERSION")
     );
-    println!("  ║   HTTP Server for Clean Language Apps     ║");
-    println!("  ╚═══════════════════════════════════════════╝");
-    println!();
+    eprintln!("  ║   HTTP Server for Clean Language Apps     ║");
+    eprintln!("  ╚═══════════════════════════════════════════╝");
+    eprintln!();
 
     let wasm_path = match args.wasm_path {
         Some(path) => path,
@@ -206,11 +211,15 @@ async fn run_server_command(args: Args) -> Result<(), i32> {
     });
 
     let mut config = ServerConfig::default()
-        .with_host(args.host)
-        .with_port(args.port)
         .with_database_pool_size(args.db_pool_size)
         .with_memory_tier(memory_tier);
 
+    if let Some(host) = args.host {
+        config = config.with_host(host);
+    }
+    if let Some(port) = args.port {
+        config = config.with_port(port);
+    }
     if let Some(mb) = args.memory_limit {
         config = config.with_memory_limit_mb(mb);
     }
@@ -224,7 +233,16 @@ async fn run_server_command(args: Args) -> Result<(), i32> {
 
     info!("Configuration:");
     info!("  WASM file: {:?}", wasm_path);
-    info!("  Listen: {}:{}", config.host, config.port);
+    info!(
+        "  Listen: {}:{}{}",
+        config.host,
+        config.port,
+        if config.port_explicit {
+            ""
+        } else {
+            " (unless the module declares server: port:)"
+        }
+    );
     info!(
         "  CORS: {}",
         if config.cors_enabled {
@@ -244,7 +262,7 @@ async fn run_server_command(args: Args) -> Result<(), i32> {
     } else {
         info!("  Database: not configured");
     }
-    println!();
+    eprintln!();
 
     match start_server(wasm_path, config).await {
         Ok(()) => {

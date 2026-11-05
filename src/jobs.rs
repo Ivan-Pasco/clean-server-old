@@ -88,6 +88,17 @@ pub fn current_job_attempt() -> i32 {
     JOB_CURRENT_ATTEMPT.try_with(|n| *n).unwrap_or(0)
 }
 
+/// Convert a duration or Unix timestamp in seconds — the unit the job bridges
+/// take, like `_time_now` — to the milliseconds the queue stores internally.
+/// Negative, NaN and infinite inputs clamp to 0.
+pub fn seconds_to_ms(seconds: f64) -> u64 {
+    if seconds.is_finite() && seconds > 0.0 {
+        (seconds * 1000.0).round() as u64
+    } else {
+        0
+    }
+}
+
 /// Request a retry after the specified delay in milliseconds (called from inside a handler).
 /// Overrides the computed backoff for this attempt.
 pub fn request_retry_after_ms(delay_ms: i64) {
@@ -1563,6 +1574,15 @@ pub fn start_cron_scheduler(state: SharedJobsState, wasm: Arc<WasmInstance>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn job_bridge_seconds_convert_to_internal_milliseconds() {
+        assert_eq!(super::seconds_to_ms(30.0), 30_000);
+        assert_eq!(super::seconds_to_ms(1.5), 1_500);
+        assert_eq!(super::seconds_to_ms(1_767_225_600.0), 1_767_225_600_000);
+        assert_eq!(super::seconds_to_ms(-5.0), 0);
+        assert_eq!(super::seconds_to_ms(f64::NAN), 0);
+    }
+
     use super::*;
 
     #[tokio::test]

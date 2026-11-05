@@ -30,7 +30,7 @@ const FS_WRITE_ERR_INVALID_PATH: i32 = 3;
 const FS_WRITE_ERR_PARENT_NOT_DIR: i32 = 4;
 const FS_WRITE_ERR_IO: i32 = 5;
 
-/// Hard-blocked path prefixes — refused regardless of `CLEAN_FS_WRITE_ROOT`.
+/// Hard-blocked path prefixes — refused regardless of the storage root.
 const FS_WRITE_BLOCKED_PREFIXES: &[&str] = &["/proc", "/sys", "/dev"];
 
 /// Classify a `std::io::Error` into an `_fs_write_bytes` error code.
@@ -73,12 +73,19 @@ fn under_blocked_system_prefix(path: &Path) -> bool {
         .any(|p| s == *p || s.starts_with(&format!("{}/", p)))
 }
 
-/// Resolve the effective root from `CLEAN_FS_WRITE_ROOT`. Returns `None` when
-/// the env var is unset OR set to the empty string — both mean "no writable
-/// paths".
+/// Environment variable naming the storage root (frame-storage STORAGE-H001).
+const STORAGE_ROOT_ENV: &str = "FRAME_STORAGE_ROOT";
+/// Earlier name of the storage root variable, still honored when
+/// `FRAME_STORAGE_ROOT` is not set.
+const LEGACY_STORAGE_ROOT_ENV: &str = "CLEAN_FS_WRITE_ROOT";
+
+/// Resolve the storage root: `FRAME_STORAGE_ROOT`, else `CLEAN_FS_WRITE_ROOT`.
+/// Returns `None` when neither is set (or both are empty) — that means "no
+/// writable paths".
 fn fs_write_root() -> Option<PathBuf> {
-    std::env::var_os("CLEAN_FS_WRITE_ROOT")
-        .filter(|v| !v.is_empty())
+    [STORAGE_ROOT_ENV, LEGACY_STORAGE_ROOT_ENV]
+        .iter()
+        .find_map(|name| std::env::var_os(name).filter(|v| !v.is_empty()))
         .map(PathBuf::from)
 }
 
@@ -126,8 +133,16 @@ fn resolve_allowlisted_path(path: &str) -> Result<PathBuf, i32> {
     let root = fs_write_root().ok_or(FS_WRITE_ERR_INVALID_PATH)?;
     let canonical_root = root.canonicalize().map_err(|_| FS_WRITE_ERR_INVALID_PATH)?;
 
+    // Relative paths are resolved against the storage root (STORAGE-H001),
+    // never against the process working directory. Absolute paths are
+    // accepted only when they already lie inside the root.
     let requested = Path::new(path);
-    let canonical_target = canonicalize_lenient(requested).ok_or(FS_WRITE_ERR_INVALID_PATH)?;
+    let requested = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        canonical_root.join(requested)
+    };
+    let canonical_target = canonicalize_lenient(&requested).ok_or(FS_WRITE_ERR_INVALID_PATH)?;
 
     if !canonical_target.starts_with(&canonical_root) {
         return Err(FS_WRITE_ERR_INVALID_PATH);
@@ -799,10 +814,7 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
             let target = match resolve_allowlisted_path(&path) {
                 Ok(p) => p,
                 Err(code) => {
-                    debug!(
-                        "_fs_delete: rejected path '{}' with code {}",
-                        path, code
-                    );
+                    debug!("_fs_delete: rejected path '{}' with code {}", path, code);
                     return 0;
                 }
             };
@@ -926,35 +938,99 @@ mod tests {
     // `test_spec_compliance` in wasm_linker/mod.rs, which validates the
     // function signature matches the registry.
     //
-    // Env-var access is serialized via `ENV_LOCK` because `CLEAN_FS_WRITE_ROOT`
-    // is a process-global and cargo runs tests in parallel by default.
+    // Env-var access is serialized via `ENV_LOCK` because the storage-root
+    // variables are process-global and cargo runs tests in parallel by default.
 
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Saves both storage-root variables and restores them on drop.
     struct EnvGuard {
-        prev: Option<std::ffi::OsString>,
+        prev: [Option<std::ffi::OsString>; 2],
     }
     impl EnvGuard {
+        fn capture() -> Self {
+            Self {
+                prev: [
+                    std::env::var_os(STORAGE_ROOT_ENV),
+                    std::env::var_os(LEGACY_STORAGE_ROOT_ENV),
+                ],
+            }
+        }
+        /// Root set through the legacy variable only.
         fn set(root: &Path) -> Self {
-            let prev = std::env::var_os("CLEAN_FS_WRITE_ROOT");
-            std::env::set_var("CLEAN_FS_WRITE_ROOT", root);
-            Self { prev }
+            let g = Self::capture();
+            std::env::remove_var(STORAGE_ROOT_ENV);
+            std::env::set_var(LEGACY_STORAGE_ROOT_ENV, root);
+            g
+        }
+        /// Root set through `FRAME_STORAGE_ROOT` (and optionally a different
+        /// legacy root, to check precedence).
+        fn set_storage_root(root: &Path, legacy: Option<&Path>) -> Self {
+            let g = Self::capture();
+            std::env::set_var(STORAGE_ROOT_ENV, root);
+            match legacy {
+                Some(l) => std::env::set_var(LEGACY_STORAGE_ROOT_ENV, l),
+                None => std::env::remove_var(LEGACY_STORAGE_ROOT_ENV),
+            }
+            g
         }
         fn unset() -> Self {
-            let prev = std::env::var_os("CLEAN_FS_WRITE_ROOT");
-            std::env::remove_var("CLEAN_FS_WRITE_ROOT");
-            Self { prev }
+            let g = Self::capture();
+            std::env::remove_var(STORAGE_ROOT_ENV);
+            std::env::remove_var(LEGACY_STORAGE_ROOT_ENV);
+            g
         }
     }
     impl Drop for EnvGuard {
         fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var("CLEAN_FS_WRITE_ROOT", v),
-                None => std::env::remove_var("CLEAN_FS_WRITE_ROOT"),
+            for (name, prev) in [STORAGE_ROOT_ENV, LEGACY_STORAGE_ROOT_ENV]
+                .iter()
+                .zip(self.prev.iter())
+            {
+                match prev {
+                    Some(v) => std::env::set_var(name, v),
+                    None => std::env::remove_var(name),
+                }
             }
         }
+    }
+
+    #[test]
+    fn storage_root_env_resolves_relative_paths_inside_root() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = TempDir::new().unwrap();
+        let _env = EnvGuard::set_storage_root(root.path(), None);
+
+        // A relative path lands under the root, whatever the cwd is.
+        let target = resolve_allowlisted_path("artifacts/a.txt").unwrap();
+        assert_eq!(
+            target,
+            root.path().canonicalize().unwrap().join("artifacts/a.txt")
+        );
+        atomic_write_bytes(&target, b"hello").unwrap();
+        assert_eq!(
+            std::fs::read(root.path().join("artifacts/a.txt")).unwrap(),
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn storage_root_env_takes_precedence_over_legacy_root() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = TempDir::new().unwrap();
+        let legacy = TempDir::new().unwrap();
+        let _env = EnvGuard::set_storage_root(root.path(), Some(legacy.path()));
+
+        let target = resolve_allowlisted_path("x.bin").unwrap();
+        assert!(target.starts_with(root.path().canonicalize().unwrap()));
+        // An absolute path inside the legacy root is outside the storage root.
+        let outside = legacy.path().canonicalize().unwrap().join("x.bin");
+        assert_eq!(
+            resolve_allowlisted_path(outside.to_str().unwrap()).unwrap_err(),
+            FS_WRITE_ERR_INVALID_PATH
+        );
     }
 
     /// Full round-trip: resolve path via allowlist, then atomically write.
@@ -1129,7 +1205,10 @@ mod tests {
             let payload: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
             let name = format!("len_{}.bin", len);
             let written = write_bytes_within_root(&name, &root, &payload).unwrap();
-            assert_eq!(fs::metadata(&written).unwrap().len() as usize, payload.len());
+            assert_eq!(
+                fs::metadata(&written).unwrap().len() as usize,
+                payload.len()
+            );
             assert_eq!(fs::read(&written).unwrap(), payload);
         }
     }

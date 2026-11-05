@@ -120,6 +120,8 @@ pub enum McpTransport {
 /// A pending HTTP MCP request waiting for a WASM-side response
 pub struct McpPendingRequest {
     pub body: String,
+    /// Request headers (lower-cased names), readable via `_mcp_http_header`
+    pub headers: Vec<(String, String)>,
     /// Sync channel sender used to deliver the WASM response back to the HTTP handler
     pub response_tx: std::sync::mpsc::SyncSender<String>,
 }
@@ -135,6 +137,11 @@ pub struct McpBridgeState {
         Condvar,
     ),
     pub current_http_response: Mutex<Option<std::sync::mpsc::SyncSender<String>>>,
+    /// Headers of the request returned by the most recent `_mcp_http_accept`
+    pub current_http_headers: Mutex<Vec<(String, String)>>,
+    /// API key required as `Authorization: Bearer <key>` on every HTTP request
+    /// (frame.mcp `apiKey:`), set via `_mcp_http_require_key`
+    pub api_key: Mutex<Option<String>>,
     pub sse_clients:
         Mutex<std::collections::HashMap<String, tokio::sync::mpsc::UnboundedSender<String>>>,
 }
@@ -148,6 +155,8 @@ impl McpBridgeState {
                 Condvar::new(),
             ),
             current_http_response: Mutex::new(None),
+            current_http_headers: Mutex::new(Vec::new()),
+            api_key: Mutex::new(None),
             sse_clients: Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -216,6 +225,16 @@ pub struct WasmState {
     pub request_context: Option<RequestContext>,
     /// Auth context (if authenticated)
     pub auth_context: Option<AuthContext>,
+    /// Session stored during this request (`_session_store` blob). It is the
+    /// caller's session for the rest of the request, before the browser has
+    /// echoed its cookie back.
+    pub request_session_id: Option<String>,
+    /// Locale selected with `_i18n_set_locale` during this request. `None`
+    /// means the module's default locale (`LocaleState::default_locale`).
+    pub active_locale: Option<String>,
+    /// `true` while the module's entry point runs at startup. Bridges that
+    /// configure module-wide defaults (e.g. `_i18n_set_locale`) use it.
+    pub initializing: bool,
     /// Last error (for error reporting)
     pub last_error: Option<String>,
     /// Database bridge for database operations
@@ -445,6 +464,9 @@ impl WasmState {
             port: 3000,
             request_context: None,
             auth_context: None,
+            request_session_id: None,
+            active_locale: None,
+            initializing: false,
             last_error: None,
             db_bridge: Arc::new(TokioRwLock::new(DbBridge::new())),
             session_store: create_session_store(SessionConfig::default()),
@@ -482,6 +504,9 @@ impl WasmState {
             port: 3000,
             request_context: None,
             auth_context: None,
+            request_session_id: None,
+            active_locale: None,
+            initializing: false,
             last_error: None,
             db_bridge,
             session_store: create_session_store(SessionConfig::default()),
@@ -529,6 +554,9 @@ impl WasmState {
             port: 3000,
             request_context: None,
             auth_context: None,
+            request_session_id: None,
+            active_locale: None,
+            initializing: false,
             last_error: None,
             db_bridge,
             session_store,
@@ -575,6 +603,8 @@ impl WasmState {
     pub fn clear_request(&mut self) {
         self.request_context = None;
         self.auth_context = None;
+        self.request_session_id = None;
+        self.active_locale = None;
         self.pending_set_cookie = None;
         self.pending_headers.clear();
         self.pending_redirect = None;
@@ -1041,6 +1071,7 @@ impl WasmInstance {
         for name in entry_names {
             if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, name) {
                 info!("Calling WASM entry point: {}", name);
+                store.data_mut().initializing = true;
 
                 func.call(&mut store, ())
                     .map_err(|e| RuntimeError::wasm(format!("Failed to call {}: {}", name, e)))?;
@@ -1057,6 +1088,9 @@ impl WasmInstance {
                     );
                 }
                 *self.startup_snapshot.write() = snapshot.map(Arc::new);
+                store.data_mut().initializing = false;
+
+                self.configure_session_from_module();
 
                 // Run any migrations registered during WASM startup
                 let db = self.db_bridge.clone();
@@ -1369,6 +1403,95 @@ impl WasmInstance {
     /// Check if an export exists
     pub fn has_export(&self, name: &str) -> bool {
         self.module.exports().any(|e| e.name() == name)
+    }
+
+    /// Call a module export of shape `(string) -> string` (or `() -> string`
+    /// when `arg` is `None`) on a fresh request-like instance carrying the
+    /// startup state. Strings use the Clean ABI: a pointer to a
+    /// length-prefixed UTF-8 buffer, allocated with the module's `malloc`.
+    ///
+    /// Returns `Ok(None)` when the export is absent or has another signature.
+    fn call_string_export(&self, name: &str, arg: Option<&str>) -> RuntimeResult<Option<String>> {
+        if !self.has_export(name) {
+            return Ok(None);
+        }
+        let (mut store, instance) = self.create_instance()?;
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .ok_or_else(|| RuntimeError::wasm("Module has no memory export"))?;
+        let result_ptr = match arg {
+            Some(arg) => {
+                let func = match instance.get_typed_func::<i32, i32>(&mut store, name) {
+                    Ok(f) => f,
+                    Err(_) => return Ok(None),
+                };
+                let malloc = instance
+                    .get_typed_func::<i32, i32>(&mut store, "malloc")
+                    .map_err(|e| RuntimeError::wasm(format!("Module has no malloc: {}", e)))?;
+                let bytes = arg.as_bytes();
+                let ptr = malloc
+                    .call(&mut store, (4 + bytes.len()) as i32)
+                    .map_err(|e| RuntimeError::wasm(format!("malloc failed: {}", e)))?;
+                if ptr <= 0 {
+                    return Err(RuntimeError::wasm("malloc returned a null pointer"));
+                }
+                let mut buf = Vec::with_capacity(4 + bytes.len());
+                buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                buf.extend_from_slice(bytes);
+                memory.write(&mut store, ptr as usize, &buf).map_err(|e| {
+                    RuntimeError::memory(format!("Failed to write argument: {}", e))
+                })?;
+                func.call(&mut store, ptr)
+                    .map_err(|e| RuntimeError::wasm(format!("{} trapped: {}", name, e)))?
+            }
+            None => {
+                let func = match instance.get_typed_func::<(), i32>(&mut store, name) {
+                    Ok(f) => f,
+                    Err(_) => return Ok(None),
+                };
+                func.call(&mut store, ())
+                    .map_err(|e| RuntimeError::wasm(format!("{} trapped: {}", name, e)))?
+            }
+        };
+        crate::memory::read_string_from_memory(&store, &memory, result_ptr as u32).map(Some)
+    }
+
+    /// Adopt the application's `auth: session:` settings (cookie name,
+    /// path, SameSite, Secure, HttpOnly, timeout) for the host session store.
+    ///
+    /// frame.auth bakes these settings into its generated
+    /// `__auth_build_cookie_header(sessionId)` helper, so the host calls it
+    /// once after startup and parses the `Set-Cookie` value it returns.
+    /// Modules without frame.auth keep `SessionConfig::default()`.
+    pub fn configure_session_from_module(&self) {
+        const HELPER: &str = "__auth_build_cookie_header";
+        match self.call_string_export(HELPER, Some("probe")) {
+            Ok(Some(header)) => match SessionConfig::from_set_cookie(&header) {
+                Some(config) => self
+                    .session_store
+                    .write()
+                    .expect("session store lock poisoned")
+                    .set_config(config),
+                None => warn!("{} returned an unusable cookie: {:?}", HELPER, header),
+            },
+            Ok(None) => {}
+            Err(e) => warn!("Could not read the session cookie settings: {}", e),
+        }
+    }
+
+    /// Verify a JWT with the application's configured secret and algorithm
+    /// by calling frame.auth's generated `jwt_verify(token)` helper. Returns
+    /// the verified claims JSON, or `None` when the token is invalid, expired,
+    /// or the module has no JWT configuration.
+    pub fn verify_bearer_token(&self, token: &str) -> Option<String> {
+        match self.call_string_export("jwt_verify", Some(token)) {
+            Ok(Some(claims)) if !claims.trim().is_empty() => Some(claims),
+            Ok(_) => None,
+            Err(e) => {
+                warn!("Bearer token verification failed: {}", e);
+                None
+            }
+        }
     }
 }
 

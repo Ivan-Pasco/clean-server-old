@@ -9,9 +9,9 @@ use crate::error::{HttpError, RuntimeError, RuntimeResult};
 use crate::rate_limit::{RateLimiter, SharedRateLimiter, rate_limit_middleware};
 use crate::router::{HttpMethod, SharedRouter};
 use crate::runtime_config::{CorsConfig, RuntimeConfig};
-use crate::session::{SharedSessionStore, parse_cookies};
 use crate::wasm::{
     AuthContext, RequestContext, SharedDbBridge, SharedIslandsStore, SharedWasmInstance,
+    WasmInstance,
 };
 use crate::websocket::{SharedWsState, WsRouteHandlers, ws_handle_connection};
 use axum::{
@@ -130,6 +130,12 @@ pub struct ServerConfig {
     pub memory_tier: MemoryTier,
     /// Explicit memory limit in bytes (overrides tier if set)
     pub memory_limit: Option<usize>,
+    /// `true` when `host` was set explicitly (CLI `--host` or `with_host`).
+    /// An explicit host wins over a module's `server: host:` declaration.
+    pub host_explicit: bool,
+    /// `true` when `port` was set explicitly (CLI `--port` or `with_port`).
+    /// An explicit port wins over a module's `server: port:` declaration.
+    pub port_explicit: bool,
 }
 
 impl Default for ServerConfig {
@@ -154,6 +160,8 @@ impl Default for ServerConfig {
             database_max_connections: 10,
             memory_tier,
             memory_limit,
+            host_explicit: false,
+            port_explicit: false,
         }
     }
 }
@@ -165,14 +173,48 @@ impl ServerConfig {
             .unwrap_or_else(|| self.memory_tier.max_bytes())
     }
 
+    /// Set the listen port explicitly. An explicit port takes precedence over
+    /// the port a module declares in its `server:` block.
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
+        self.port_explicit = true;
         self
     }
 
+    /// Set the bind host explicitly. An explicit host takes precedence over
+    /// the host a module declares in its `server:` block.
     pub fn with_host(mut self, host: impl Into<String>) -> Self {
         self.host = host.into();
+        self.host_explicit = true;
         self
+    }
+
+    /// Apply the listen address a module declared during initialization
+    /// (`_http_listen` / `_http_listen_on`). Module values replace the
+    /// defaults; values set explicitly by the operator are kept.
+    pub fn apply_module_listen(&mut self, runtime_cfg: &RuntimeConfig) {
+        if let Some(host) = &runtime_cfg.listen_host {
+            if self.host_explicit {
+                info!(
+                    "Module declares listen host {}; keeping explicit host {}",
+                    host, self.host
+                );
+            } else {
+                info!("Applying module listen host: {} (was {})", host, self.host);
+                self.host = host.clone();
+            }
+        }
+        if let Some(port) = runtime_cfg.listen_port {
+            if self.port_explicit {
+                info!(
+                    "Module declares listen port {}; keeping explicit port {}",
+                    port, self.port
+                );
+            } else {
+                info!("Applying module listen port: {} (was {})", port, self.port);
+                self.port = port;
+            }
+        }
     }
 
     pub fn with_database(mut self, url: impl Into<String>) -> Self {
@@ -472,30 +514,21 @@ pub async fn start_server(wasm_path: PathBuf, mut config: ServerConfig) -> Runti
     // during this call and write into `wasm.runtime_config()`.
     wasm.initialize()?;
 
-    // Apply WASM-declared `server:` config to the live ServerConfig before
-    // binding the listener. WASM values win over the defaults so a module's
-    // `host:` / `port:` declarations are honored without a CLI flag. CLI
-    // overrides remain the operator's path via the `--host` / `--port` args
-    // that were already merged into `config` upstream.
+    // Apply the module's `server:` listen address to the live ServerConfig
+    // before binding the listener. Module values replace the defaults; an
+    // explicit `--host` / `--port` from the operator wins.
     let runtime_cfg: RuntimeConfig = wasm.runtime_config().read().clone();
-    if let Some(host) = &runtime_cfg.listen_host {
-        info!(
-            "Applying WASM-declared listen host: {} (was {})",
-            host, config.host
-        );
-        config.host = host.clone();
-    }
-    if let Some(port) = runtime_cfg.listen_port {
-        info!(
-            "Applying WASM-declared listen port: {} (was {})",
-            port, config.port
-        );
-        config.port = port;
-    }
-    let rate_limiter: Option<SharedRateLimiter> = runtime_cfg
-        .rate_limit
-        .clone()
-        .map(|cfg| Arc::new(RateLimiter::new(cfg)));
+    config.apply_module_listen(&runtime_cfg);
+    let rate_limiter: Option<SharedRateLimiter> = runtime_cfg.rate_limit.clone().map(|cfg| {
+        let session_cookie = wasm
+            .session_store()
+            .read()
+            .expect("session store lock poisoned")
+            .config()
+            .cookie_name
+            .clone();
+        Arc::new(RateLimiter::new(cfg).with_session_cookie(session_cookie))
+    });
     let cors_runtime: Option<CorsConfig> = runtime_cfg.cors.clone();
 
     // Check if any routes were registered
@@ -1035,7 +1068,7 @@ async fn handle_request_inner(
     debug!("Extracted route params: {:?}", params);
 
     // Try to extract auth context from session cookie
-    let auth_context = extract_auth_from_headers(&headers, state.wasm.session_store());
+    let auth_context = extract_auth_from_headers(&headers, &state.wasm);
 
     // Check authentication for protected routes
     if route_handler.protected {
@@ -1336,55 +1369,45 @@ fn handler_response_to_axum_response(handler_response: crate::wasm::HandlerRespo
     builder.body(Body::from(body)).expect("response builder")
 }
 
-/// Extract auth context from request headers (session cookie or JWT)
-fn extract_auth_from_headers(
-    headers: &HeaderMap,
-    session_store: &SharedSessionStore,
-) -> Option<AuthContext> {
-    // Try to get session from cookie first
-    if let Some(cookie_header) = headers.get(header::COOKIE)
-        && let Ok(cookie_str) = cookie_header.to_str()
-    {
-        let cookies = parse_cookies(cookie_str);
-
-        // Try common session cookie names
-        let session_id = cookies
-            .get("session")
-            .or_else(|| cookies.get("todo.sid"))
-            .or_else(|| cookies.get("sid"));
-
-        if let Some(session_id) = session_id {
-            // Look up session
-            let mut store = session_store.write().expect("store lock poisoned");
-            if let Some(session) = store.get(session_id) {
-                debug!(
-                    "Found valid session {} for user {}",
-                    session.session_id, session.user_id
-                );
-                return Some(AuthContext {
-                    user_id: session.user_id,
-                    role: session.role,
-                    session_id: Some(session.session_id),
-                });
-            }
+/// Resolve the caller's identity for a request.
+///
+/// 1. The session cookie, under the application's configured cookie name
+///    (frame.auth `auth: session: cookie`, default `frame.sid`), looked up in
+///    the session store — typed sessions and `auth.session.create` blobs.
+/// 2. An `Authorization: Bearer <jwt>` header, verified with the
+///    application's JWT secret and algorithm (frame-auth AUTH-J004).
+fn extract_auth_from_headers(headers: &HeaderMap, wasm: &WasmInstance) -> Option<AuthContext> {
+    if let Some(cookie_str) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
+        let mut store = wasm.session_store().write().expect("store lock poisoned");
+        if let Some(session_id) = store.session_id_from_cookie_header(cookie_str)
+            && let Some(identity) = store.identity(&session_id)
+        {
+            debug!(
+                "Found valid session {} for user {}",
+                session_id, identity.user_id
+            );
+            return Some(AuthContext {
+                user_id: identity.user_id,
+                role: identity.role,
+                session_id: Some(session_id),
+            });
         }
     }
 
-    // Try Bearer token from Authorization header
-    if let Some(auth_header) = headers.get(header::AUTHORIZATION)
-        && let Ok(auth_str) = auth_header.to_str()
-        && let Some(token) = auth_str.strip_prefix("Bearer ")
-    {
-        // For now, just log that we received a token
-        // Full JWT validation would go here
-        debug!(
-            "Received Bearer token: {}...",
-            &token[..token.len().min(10)]
-        );
-        // JWT validation would return AuthContext here
-    }
-
-    None
+    let token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())?;
+    let claims = wasm.verify_bearer_token(token)?;
+    let identity = crate::session::identity_from_jwt_claims(&claims)?;
+    debug!("Verified bearer token for user {}", identity.user_id);
+    Some(AuthContext {
+        user_id: identity.user_id,
+        role: identity.role,
+        session_id: None,
+    })
 }
 
 /// Graceful shutdown signal handler
@@ -1459,6 +1482,132 @@ fn inject_head_tags(body: String, links: Vec<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Lay out `s` as a WAT data string of a Clean length-prefixed string.
+    fn lp_data(s: &str) -> String {
+        let mut out = String::new();
+        for b in (s.len() as u32).to_le_bytes() {
+            out.push_str(&format!("\\{:02x}", b));
+        }
+        for b in s.bytes() {
+            out.push_str(&format!("\\{:02x}", b));
+        }
+        out
+    }
+
+    /// A module shaped like a frame.auth application: it exports the
+    /// generated `__auth_build_cookie_header` and `jwt_verify` helpers.
+    /// `jwt_verify` accepts exactly the token `abc.def.g`.
+    fn auth_module() -> Vec<u8> {
+        let cookie = "app.sid=probe; Path=/; SameSite=Lax; HttpOnly; Max-Age=300";
+        let claims = r#"{"sub":7,"role":"user"}"#;
+        let token = "abc.def.g";
+        let wat = format!(
+            r#"(module
+  (memory (export "memory") 1)
+  (global $heap (export "__heap_ptr") (mut i32) (i32.const 8192))
+  (data (i32.const 1024) "{cookie}")
+  (data (i32.const 2048) "{claims}")
+  (data (i32.const 3072) "{token}")
+  (data (i32.const 4000) "\00\00\00\00")
+  (func (export "malloc") (param $n i32) (result i32)
+    (local $p i32)
+    (local.set $p (global.get $heap))
+    (global.set $heap (i32.and (i32.add (i32.add (global.get $heap) (local.get $n)) (i32.const 7)) (i32.const -8)))
+    (local.get $p))
+  (func (export "main"))
+  (func (export "__auth_build_cookie_header") (param i32) (result i32) (i32.const 1024))
+  (func (export "jwt_verify") (param $t i32) (result i32)
+    (local $i i32)
+    (if (i32.ne (i32.load (local.get $t)) (i32.load (i32.const 3072)))
+      (then (return (i32.const 4000))))
+    (block $done
+      (loop $next
+        (br_if $done (i32.ge_u (local.get $i) (i32.load (i32.const 3072))))
+        (if (i32.ne
+              (i32.load8_u (i32.add (i32.add (local.get $t) (i32.const 4)) (local.get $i)))
+              (i32.load8_u (i32.add (i32.const 3076) (local.get $i))))
+          (then (return (i32.const 4000))))
+        (local.set $i (i32.add (local.get $i) (i32.const 1)))
+        (br $next)))
+    (i32.const 2048))
+)"#,
+            cookie = lp_data(cookie),
+            claims = lp_data(claims),
+            token = lp_data(token),
+        );
+        wat::parse_str(&wat).expect("auth module WAT")
+    }
+
+    fn headers(pairs: &[(header::HeaderName, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(name.clone(), value.parse().unwrap());
+        }
+        map
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auth_uses_configured_session_cookie_and_bearer_jwt() {
+        let wasm = WasmInstance::from_bytes(&auth_module(), crate::router::create_shared_router())
+            .expect("load module");
+        wasm.initialize().expect("initialize");
+
+        // The application's `auth: session:` settings were adopted.
+        {
+            let store = wasm.session_store().read().unwrap();
+            assert_eq!(store.config().cookie_name, "app.sid");
+            assert_eq!(store.config().timeout_seconds, 300);
+        }
+
+        // A session made by auth.session.create (raw blob) is recognised
+        // through the configured cookie name.
+        wasm.session_store().write().unwrap().store_raw(
+            "s1",
+            r#"{"userId":5,"claims":{"role":"editor"},"expiry":0}"#,
+        );
+        let ctx = extract_auth_from_headers(&headers(&[(header::COOKIE, "app.sid=s1")]), &wasm)
+            .expect("session cookie recognised");
+        assert_eq!(ctx.user_id, 5);
+        assert_eq!(ctx.role, "editor");
+        assert_eq!(ctx.session_id.as_deref(), Some("s1"));
+        // Hardcoded legacy names are no longer the session cookie.
+        assert!(
+            extract_auth_from_headers(&headers(&[(header::COOKIE, "session=s1")]), &wasm).is_none()
+        );
+
+        // Bearer JWTs are verified with the application's own helper.
+        let ctx = extract_auth_from_headers(
+            &headers(&[(header::AUTHORIZATION, "Bearer abc.def.g")]),
+            &wasm,
+        )
+        .expect("valid bearer token");
+        assert_eq!(ctx.user_id, 7);
+        assert_eq!(ctx.role, "user");
+        assert!(ctx.session_id.is_none());
+        assert!(
+            extract_auth_from_headers(
+                &headers(&[(header::AUTHORIZATION, "Bearer abc.def.h")]),
+                &wasm
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn module_listen_port_applies_unless_explicit() {
+        let module = RuntimeConfig {
+            listen_port: Some(3476),
+            ..RuntimeConfig::default()
+        };
+        let mut config = ServerConfig::default();
+        config.apply_module_listen(&module);
+        assert_eq!(config.port, 3476);
+
+        let mut explicit = ServerConfig::default().with_port(4000);
+        explicit.apply_module_listen(&module);
+        assert_eq!(explicit.port, 4000);
+    }
 
     #[test]
     fn test_server_config_default() {

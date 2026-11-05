@@ -59,7 +59,7 @@ fn job_bridge_functions_are_all_registered() {
     // _job_enqueue(name_ptr, name_len, args_ptr, args_len) -> i32
     probe!("_job_enqueue", "(param i32 i32 i32 i32)", "(result i32)");
 
-    // _job_enqueue_at(name_ptr, name_len, args_ptr, args_len, run_at_ms: f64) -> i32
+    // _job_enqueue_at(name_ptr, name_len, args_ptr, args_len, run_at_seconds: f64) -> i32
     // plugin.toml declares the timestamp param as "number" (= WASM f64).
     probe!(
         "_job_enqueue_at",
@@ -85,7 +85,7 @@ fn job_bridge_functions_are_all_registered() {
     // _job_current_attempt() -> i32
     probe!("_job_current_attempt", "", "(result i32)");
 
-    // _job_retry_after(delay_ms) -> void
+    // _job_retry_after(delay_seconds) -> void
     probe!("_job_retry_after", "(param i32)", "");
 
     // _job_fail(reason_ptr, reason_len) -> void

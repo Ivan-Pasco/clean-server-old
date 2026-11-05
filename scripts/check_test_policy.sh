@@ -48,6 +48,7 @@ TIER2_FILES=(
   json_conformance.rs
   startup_state_test.rs
   schedule_cron_bridge_test.rs
+  request_state_bridge_test.rs
 )
 
 TIER3_FILES=(

@@ -173,3 +173,114 @@ fn server_boots_serves_and_shuts_down() {
         "server_smoke_test: clean-server did not exit within 2 seconds of SIGTERM/kill"
     );
 }
+
+/// A module whose entry point declares its listen port via `_http_listen`,
+/// as frame.server emits for `server: port: N` without `host:`.
+fn listen_module(port: u16) -> Vec<u8> {
+    let wat = format!(
+        r#"(module
+  (import "env" "_http_listen" (func $listen (param i32) (result i32)))
+  (memory (export "memory") 1)
+  (global (export "__heap_ptr") i32 (i32.const 65536))
+  (func (export "main") (drop (call $listen (i32.const {port}))))
+)"#
+    );
+    wat::parse_str(&wat).expect("listen module WAT")
+}
+
+/// Spawn the server binary for this test profile with stdout/stderr captured
+/// to files in `dir`; returns the child.
+fn spawn_server(dir: &std::path::Path, wasm: &[u8], args: &[&str]) -> std::process::Child {
+    let wasm_path = dir.join("app.wasm");
+    std::fs::write(&wasm_path, wasm).expect("write wasm");
+    Command::new(env!("CARGO_BIN_EXE_clean-server"))
+        .arg(&wasm_path)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(
+            std::fs::File::create(dir.join("server.out")).expect("stdout log"),
+        ))
+        .stderr(Stdio::from(
+            std::fs::File::create(dir.join("server.err")).expect("stderr log"),
+        ))
+        .spawn()
+        .expect("spawn clean-server")
+}
+
+fn wait_for_port(port: u16, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{port}").parse().unwrap(),
+            Duration::from_millis(200),
+        )
+        .is_ok()
+        {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+fn stop(mut child: std::process::Child, dir: &std::path::Path) -> (String, String) {
+    let _ = child.kill();
+    let _ = child.wait();
+    (
+        std::fs::read_to_string(dir.join("server.out")).unwrap_or_default(),
+        std::fs::read_to_string(dir.join("server.err")).unwrap_or_default(),
+    )
+}
+
+#[test]
+fn module_declared_port_is_bound_without_cli_port() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let port = pick_port();
+    let child = spawn_server(temp.path(), &listen_module(port), &["--host", "127.0.0.1"]);
+    let up = wait_for_port(port, Duration::from_secs(15));
+    let (out, err) = stop(child, temp.path());
+    assert!(
+        up,
+        "server did not bind the module's `server: port:` {port}\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+    );
+}
+
+#[test]
+fn explicit_cli_port_wins_over_module_port() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let module_port = pick_port();
+    let cli_port = pick_port();
+    let child = spawn_server(
+        temp.path(),
+        &listen_module(module_port),
+        &["--host", "127.0.0.1", "--port", &cli_port.to_string()],
+    );
+    let up = wait_for_port(cli_port, Duration::from_secs(15));
+    let (out, err) = stop(child, temp.path());
+    assert!(
+        up,
+        "server did not bind the explicit --port {cli_port}\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
+    );
+}
+
+/// stdout belongs to the application (and is the JSON-RPC stream of a stdio
+/// MCP server, frame.mcp §8.1): the banner and all logs go to stderr.
+#[test]
+fn server_logs_go_to_stderr_not_stdout() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let port = pick_port();
+    let wasm = wat::parse_str(NOOP_WAT).expect("no-op WAT");
+    let child = spawn_server(
+        temp.path(),
+        &wasm,
+        &["--host", "127.0.0.1", "--port", &port.to_string()],
+    );
+    let up = wait_for_port(port, Duration::from_secs(15));
+    let (out, err) = stop(child, temp.path());
+    assert!(up, "server did not start\n--- stderr ---\n{err}");
+    assert_eq!(out, "", "nothing but application output may reach stdout");
+    assert!(
+        err.contains("Server listening"),
+        "logs must reach stderr; got:\n{err}"
+    );
+}

@@ -67,6 +67,17 @@ impl DatabaseDriver {
         }
     }
 
+    /// Adapt SQL the host builds itself (written with `?` placeholders) to the
+    /// driver's placeholder syntax: PostgreSQL numbers them `$1, $2, ...`.
+    /// Application SQL is passed through untouched by the query paths; only
+    /// host-generated statements go through here.
+    pub fn host_sql(&self, sql: &str) -> String {
+        match self {
+            Self::Postgres(_) => number_placeholders(sql),
+            Self::MySql(_) | Self::Sqlite(_) => sql.to_string(),
+        }
+    }
+
     /// Execute a SELECT query and return rows as JSON
     pub async fn query(
         &self,
@@ -891,9 +902,10 @@ impl DbBridge {
 
         for migration in &migrations {
             // Check if already applied
-            let check_sql = "SELECT COUNT(*) AS cnt FROM _clean_migrations WHERE name = ?";
+            let check_sql =
+                driver.host_sql("SELECT COUNT(*) AS cnt FROM _clean_migrations WHERE name = ?");
             let rows = driver
-                .query(check_sql, &[Value::String(migration.name.clone())])
+                .query(&check_sql, &[Value::String(migration.name.clone())])
                 .await;
             let already_applied = match rows {
                 Ok(ref r) => {
@@ -925,10 +937,11 @@ impl DbBridge {
 
             // Record as applied
             let now = chrono::Utc::now().to_rfc3339();
-            let record_sql = "INSERT INTO _clean_migrations (name, applied_at) VALUES (?, ?)";
+            let record_sql =
+                driver.host_sql("INSERT INTO _clean_migrations (name, applied_at) VALUES (?, ?)");
             driver
                 .execute(
-                    record_sql,
+                    &record_sql,
                     &[Value::String(migration.name.clone()), Value::String(now)],
                 )
                 .await?;
@@ -1590,6 +1603,15 @@ impl DbBridge {
         };
 
         let (where_clause, bind_params) = build_where_clause(&where_json);
+        let order_by = match order_by_clause(&where_json) {
+            Ok(o) => o,
+            Err(msg) => {
+                return Ok(json!({
+                    "ok": false,
+                    "err": { "code": "VALIDATION_ERROR", "message": msg, "details": {} }
+                }));
+            }
+        };
 
         let count_sql = if where_clause.is_empty() {
             format!("SELECT COUNT(*) AS __total FROM {}", table)
@@ -1600,6 +1622,7 @@ impl DbBridge {
             )
         };
 
+        let count_sql = driver.host_sql(&count_sql);
         let count_result = tokio::time::timeout(
             Duration::from_millis(timeout),
             driver.query(&count_sql, &bind_params),
@@ -1634,17 +1657,18 @@ impl DbBridge {
             0
         };
 
-        let data_sql = if where_clause.is_empty() {
-            format!(
-                "SELECT * FROM {} LIMIT {} OFFSET {}",
-                table, per_page, offset
-            )
+        let where_sql = if where_clause.is_empty() {
+            String::new()
         } else {
-            format!(
-                "SELECT * FROM {} WHERE {} LIMIT {} OFFSET {}",
-                table, where_clause, per_page, offset
-            )
+            format!(" WHERE {}", where_clause)
         };
+        let order_sql = order_by
+            .map(|o| format!(" ORDER BY {}", o))
+            .unwrap_or_default();
+        let data_sql = driver.host_sql(&format!(
+            "SELECT * FROM {}{}{} LIMIT {} OFFSET {}",
+            table, where_sql, order_sql, per_page, offset
+        ));
 
         let data_result = tokio::time::timeout(
             Duration::from_millis(timeout),
@@ -1747,7 +1771,8 @@ impl DbBridge {
         let full_where = if after.is_empty() {
             where_clause.clone()
         } else {
-            bind_params.push(Value::String(after.clone()));
+            let numeric = cursor_column_is_numeric(&driver, &table, &by_field).await;
+            bind_params.push(cursor_bind_value(&after, numeric));
             let cursor_cond = format!("{} > ?", by_field);
             if where_clause.is_empty() {
                 cursor_cond
@@ -1773,6 +1798,7 @@ impl DbBridge {
             )
         };
 
+        let sql = driver.host_sql(&sql);
         let result = tokio::time::timeout(
             Duration::from_millis(timeout),
             driver.query(&sql, &bind_params),
@@ -1978,7 +2004,7 @@ impl DbBridge {
 
         let _ = driver
             .execute(
-                "DELETE FROM _clean_migrations WHERE name = ?",
+                &driver.host_sql("DELETE FROM _clean_migrations WHERE name = ?"),
                 &[Value::String(name)],
             )
             .await;
@@ -2145,6 +2171,139 @@ fn is_safe_identifier(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Rewrite `?` placeholders as PostgreSQL's numbered `$1, $2, ...`, leaving
+/// `?` inside single-quoted literals and double-quoted identifiers alone.
+fn number_placeholders(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut n = 0;
+    let mut quote: Option<char> = None;
+    for c in sql.chars() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+                out.push(c);
+            }
+            None => match c {
+                '\'' | '"' => {
+                    quote = Some(c);
+                    out.push(c);
+                }
+                '?' => {
+                    n += 1;
+                    out.push('$');
+                    out.push_str(&n.to_string());
+                }
+                _ => out.push(c),
+            },
+        }
+    }
+    out
+}
+
+/// Validate the `__order` key of a paginate where-object — an ORDER BY list
+/// such as `"created_at DESC, id ASC"` — and return it normalised. Each term
+/// is a column (optionally `table.column`) with an optional ASC/DESC.
+/// Returns `Ok(None)` when no order was requested.
+fn order_by_clause(where_json: &Value) -> std::result::Result<Option<String>, String> {
+    let raw = match where_json.get("__order").and_then(|v| v.as_str()) {
+        Some(o) if !o.trim().is_empty() => o,
+        _ => return Ok(None),
+    };
+    let mut terms = Vec::new();
+    for term in raw.split(',') {
+        let mut words = term.split_whitespace();
+        let column = words
+            .next()
+            .ok_or_else(|| format!("Invalid order clause: {:?}", raw))?;
+        if !column.split('.').all(is_safe_identifier) {
+            return Err(format!("Invalid order column: {:?}", column));
+        }
+        let direction = match words.next().map(|d| d.to_ascii_uppercase()) {
+            None => None,
+            Some(d) if d == "ASC" || d == "DESC" => Some(d),
+            Some(d) => return Err(format!("Invalid order direction: {:?}", d)),
+        };
+        if words.next().is_some() {
+            return Err(format!("Invalid order clause: {:?}", raw));
+        }
+        terms.push(match direction {
+            Some(d) => format!("{} {}", column, d),
+            None => column.to_string(),
+        });
+    }
+    Ok(Some(terms.join(", ")))
+}
+
+/// The bind value for a cursor `after` value. The cursor travels through
+/// Clean code as text, but must be compared with the column's own type —
+/// PostgreSQL rejects `integer > text`. Numeric columns get a number;
+/// everything else stays text. `numeric` is `None` when the column type is
+/// unknown, in which case an integer-looking cursor is bound as an integer.
+fn cursor_bind_value(after: &str, numeric: Option<bool>) -> Value {
+    let trimmed = after.trim();
+    let as_number = || {
+        trimmed.parse::<i64>().map(Value::from).ok().or_else(|| {
+            trimmed
+                .parse::<f64>()
+                .ok()
+                .filter(|f| f.is_finite())
+                .map(Value::from)
+        })
+    };
+    match numeric {
+        Some(true) => as_number().unwrap_or_else(|| Value::String(after.to_string())),
+        Some(false) => Value::String(after.to_string()),
+        None => trimmed
+            .parse::<i64>()
+            .map(Value::from)
+            .unwrap_or_else(|_| Value::String(after.to_string())),
+    }
+}
+
+/// Whether the cursor column has a numeric type. Known exactly on PostgreSQL
+/// (information_schema); SQLite and MySQL coerce comparisons themselves, so
+/// there the answer is `None` (unknown).
+async fn cursor_column_is_numeric(
+    driver: &DatabaseDriver,
+    table: &str,
+    column: &str,
+) -> Option<bool> {
+    match driver {
+        DatabaseDriver::Postgres(_) => {
+            let sql = "SELECT data_type::text AS data_type FROM information_schema.columns \
+                       WHERE table_name = $1 AND column_name = $2 AND table_schema = current_schema()";
+            let rows = driver
+                .query(
+                    sql,
+                    &[
+                        Value::String(table.to_string()),
+                        Value::String(column.to_string()),
+                    ],
+                )
+                .await
+                .ok()?;
+            let data_type = rows
+                .first()?
+                .get("data_type")?
+                .as_str()?
+                .to_ascii_lowercase();
+            Some(matches!(
+                data_type.as_str(),
+                "smallint"
+                    | "integer"
+                    | "bigint"
+                    | "numeric"
+                    | "decimal"
+                    | "real"
+                    | "double precision"
+            ))
+        }
+        DatabaseDriver::MySql(_) | DatabaseDriver::Sqlite(_) => None,
+    }
+}
+
 /// Build a parameterised WHERE clause from a JSON object of equality filters.
 ///
 /// The returned tuple contains:
@@ -2216,7 +2375,7 @@ async fn introspect_table_columns(driver: &DatabaseDriver, table: &str) -> Vec<S
             }
         }
         DatabaseDriver::Postgres(_) => {
-            let sql = "SELECT column_name FROM information_schema.columns 				WHERE table_name =  AND table_schema = current_schema() ORDER BY ordinal_position";
+            let sql = "SELECT column_name::text AS column_name FROM information_schema.columns WHERE table_name = $1 AND table_schema = current_schema() ORDER BY ordinal_position";
             match driver.query(sql, &[Value::String(table.to_string())]).await {
                 Ok(rows) => rows
                     .iter()
@@ -2305,7 +2464,9 @@ fn compute_migration_diff(table: Option<&str>, declared: &Value, live: &Value) -
 /// after it, so `WITH moved AS (UPDATE ...) INSERT INTO ...` is a write
 /// while `WITH t AS (...) SELECT ...` still belongs to `query()`.
 fn is_write_statement(sql: &str) -> bool {
-    const WRITES: [&str; 7] = ["INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE"];
+    const WRITES: [&str; 7] = [
+        "INSERT", "UPDATE", "DELETE", "CREATE", "DROP", "ALTER", "TRUNCATE",
+    ];
     let upper = sql.trim().to_uppercase();
     let main = if starts_with_keyword(&upper, "WITH") {
         statement_after_with(&upper)
@@ -2394,8 +2555,12 @@ mod tests {
     #[test]
     fn reads_are_not_write_statements() {
         assert!(!is_write_statement("SELECT * FROM t"));
-        assert!(!is_write_statement("WITH t AS (SELECT 1 AS x) SELECT x FROM t"));
-        assert!(!is_write_statement("WITH u AS (UPDATE t SET x = 1 RETURNING x) SELECT x FROM u"));
+        assert!(!is_write_statement(
+            "WITH t AS (SELECT 1 AS x) SELECT x FROM t"
+        ));
+        assert!(!is_write_statement(
+            "WITH u AS (UPDATE t SET x = 1 RETURNING x) SELECT x FROM u"
+        ));
         assert!(!is_write_statement("WITH"));
         assert!(!is_write_statement("INSERTS"));
         assert!(!is_write_statement("WITHDRAW"));
@@ -2900,6 +3065,137 @@ mod frame_data_bridge_tests {
             10,
             "Should return 10 rows"
         );
+    }
+
+    #[tokio::test]
+    async fn test_paginate_honours_order_clause() {
+        let mut bridge = setup_test_db_new().await;
+        for i in 1..=5 {
+            bridge
+                .call(
+                    "execute",
+                    json!({
+                        "sql": "INSERT INTO users (name, email) VALUES (?, ?)",
+                        "params": [format!("User{}", i), format!("user{}@test.com", i)]
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        let result = bridge
+            .call(
+                "paginate",
+                json!({
+                    "table": "users",
+                    "where": {"__where": "", "__order": "name DESC"},
+                    "page": 1,
+                    "per_page": 2
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], true, "paginate should succeed: {:?}", result);
+        let names: Vec<&str> = result["data"]["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["User5", "User4"]);
+        assert_eq!(result["data"]["total"], 5);
+    }
+
+    #[tokio::test]
+    async fn test_paginate_rejects_unsafe_order_clause() {
+        let mut bridge = setup_test_db_new().await;
+        let result = bridge
+            .call(
+                "paginate",
+                json!({
+                    "table": "users",
+                    "where": {"__order": "name; DROP TABLE users"},
+                    "page": 1,
+                    "per_page": 2
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["err"]["code"], "VALIDATION_ERROR");
+    }
+
+    #[test]
+    fn test_order_by_clause_parsing() {
+        assert_eq!(order_by_clause(&json!({})), Ok(None));
+        assert_eq!(
+            order_by_clause(&json!({"__order": "created_at desc, users.id"})),
+            Ok(Some("created_at DESC, users.id".to_string()))
+        );
+        assert!(order_by_clause(&json!({"__order": "id SIDEWAYS"})).is_err());
+        assert!(order_by_clause(&json!({"__order": "id ASC extra"})).is_err());
+        assert!(order_by_clause(&json!({"__order": "(SELECT 1)"})).is_err());
+    }
+
+    #[test]
+    fn test_number_placeholders_for_postgres() {
+        assert_eq!(
+            number_placeholders("SELECT * FROM t WHERE a = ? AND b > ? LIMIT 3"),
+            "SELECT * FROM t WHERE a = $1 AND b > $2 LIMIT 3"
+        );
+        // `?` inside literals and quoted identifiers is not a placeholder.
+        assert_eq!(
+            number_placeholders("SELECT '?' AS \"q?\" FROM t WHERE a = ?"),
+            "SELECT '?' AS \"q?\" FROM t WHERE a = $1"
+        );
+    }
+
+    #[test]
+    fn test_cursor_bind_value_matches_column_type() {
+        // Numeric column: the textual cursor is bound as a number.
+        assert_eq!(cursor_bind_value("42", Some(true)), json!(42));
+        assert_eq!(cursor_bind_value("1.5", Some(true)), json!(1.5));
+        // Text column: stays text even when it looks numeric.
+        assert_eq!(cursor_bind_value("42", Some(false)), json!("42"));
+        // Unknown column type: integers become numbers, the rest text.
+        assert_eq!(cursor_bind_value("7", None), json!(7));
+        assert_eq!(cursor_bind_value("abc", None), json!("abc"));
+    }
+
+    #[tokio::test]
+    async fn test_cursor_page_after_integer_cursor() {
+        let mut bridge = setup_test_db_new().await;
+        for i in 1..=5 {
+            bridge
+                .call(
+                    "execute",
+                    json!({
+                        "sql": "INSERT INTO users (name, email) VALUES (?, ?)",
+                        "params": [format!("User{}", i), format!("user{}@test.com", i)]
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+        let result = bridge
+            .call(
+                "cursor_page",
+                json!({"table": "users", "where": {}, "per_page": 2, "after": "2", "by_field": "id"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result["ok"], true,
+            "cursor_page should succeed: {:?}",
+            result
+        );
+        let ids: Vec<i64> = result["data"]["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![3, 4]);
+        assert_eq!(result["data"]["has_more"], true);
     }
 
     #[tokio::test]

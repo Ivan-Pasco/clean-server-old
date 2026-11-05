@@ -2,9 +2,8 @@
 //!
 //! Provides:
 //! - `LocaleState` — translation maps and default locale, shared across all requests for a module.
-//! - `LOCALE` — a `tokio::task_local!` that stores the active BCP 47 locale tag for the
-//!   current request. Bridge functions read from this instead of a global so concurrent
-//!   requests cannot interfere with each other.
+//! - The active locale of a request lives in its own `WasmState` (`active_locale`), so
+//!   concurrent requests cannot interfere with each other.
 //! - Translation lookup with locale fallback and `{placeholder}` interpolation.
 //! - CLDR-simplified plural form selection (`_zero`, `_one`, `_few`, `_many`, `_other`).
 //! - Locale-aware number, currency, and date formatting backed by `chrono` for date/time
@@ -14,37 +13,6 @@ use chrono::{DateTime, Datelike, TimeZone, Utc, Weekday};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-
-// ---------------------------------------------------------------------------
-// Task-local: active locale for the current request
-// ---------------------------------------------------------------------------
-
-tokio::task_local! {
-    /// The active BCP 47 locale tag for the current request (e.g. `"en"`, `"fr-CA"`).
-    /// Set by `_i18n_set_locale` at the start of each request.
-    /// Falls back to `LocaleState::default_locale` when not set.
-    pub static LOCALE: std::cell::RefCell<String>;
-}
-
-/// Retrieve the active locale from task-local storage.
-/// Returns an empty string when called outside a request context; callers
-/// should fall back to `LocaleState::default_locale` in that case.
-pub fn current_locale() -> String {
-    LOCALE
-        .try_with(|cell| cell.borrow().clone())
-        .unwrap_or_default()
-}
-
-/// Set the active locale in task-local storage.
-/// This only works when called from within a `LOCALE.scope(...)` block.
-/// Returns `true` on success, `false` when called outside the scope.
-pub fn set_current_locale(locale: String) -> bool {
-    LOCALE
-        .try_with(|cell| {
-            *cell.borrow_mut() = locale;
-        })
-        .is_ok()
-}
 
 // ---------------------------------------------------------------------------
 // RTL detection
@@ -68,16 +36,41 @@ pub fn is_rtl(locale: &str) -> bool {
 /// Holds all loaded translation maps for a module.
 #[derive(Debug, Default)]
 pub struct LocaleState {
+    /// The module's default locale (frame.locale `locale: default`).
     pub default_locale: String,
+    /// The locale consulted when a key is missing from the requested and the
+    /// default locale (frame.locale `locale: fallback`).
+    pub fallback_locale: String,
     pub translations: HashMap<String, HashMap<String, String>>,
+    /// Locales in the order their translations were first loaded.
+    load_order: Vec<String>,
 }
 
 impl LocaleState {
     pub fn new(default_locale: impl Into<String>) -> Self {
+        let default_locale = default_locale.into();
         Self {
-            default_locale: default_locale.into(),
+            fallback_locale: default_locale.clone(),
+            default_locale,
             translations: HashMap::new(),
+            load_order: Vec::new(),
         }
+    }
+
+    /// Set the module's default locale (startup `_i18n_set_locale`).
+    ///
+    /// frame.locale's startup code loads the default locale's translations,
+    /// then the fallback locale's (only when it differs), then selects the
+    /// default. The fallback is therefore the first loaded locale other than
+    /// the default; with none, the default is its own fallback.
+    pub fn set_default_locale(&mut self, locale: &str) {
+        self.default_locale = locale.to_string();
+        self.fallback_locale = self
+            .load_order
+            .iter()
+            .find(|l| l.as_str() != locale)
+            .cloned()
+            .unwrap_or_else(|| locale.to_string());
     }
 
     /// Load (or replace) the translation map for `locale` from a JSON string.
@@ -90,6 +83,9 @@ impl LocaleState {
         let mut flat: HashMap<String, String> = HashMap::new();
         flatten_json(&value, String::new(), &mut flat);
         self.translations.insert(locale.to_string(), flat);
+        if !self.load_order.iter().any(|l| l == locale) {
+            self.load_order.push(locale.to_string());
+        }
         Ok(())
     }
 
@@ -108,11 +104,13 @@ impl LocaleState {
                 return Some(val.as_str());
             }
         }
-        if locale != self.default_locale
-            && let Some(map) = self.translations.get(&self.default_locale)
-            && let Some(val) = map.get(key)
-        {
-            return Some(val.as_str());
+        for candidate in [&self.default_locale, &self.fallback_locale] {
+            if locale != candidate.as_str()
+                && let Some(map) = self.translations.get(candidate)
+                && let Some(val) = map.get(key)
+            {
+                return Some(val.as_str());
+            }
         }
         None
     }
@@ -535,6 +533,8 @@ pub fn format_currency(value: f64, currency_code: &str, locale: &str) -> String 
 // Date formatting
 // ---------------------------------------------------------------------------
 
+/// Format a Unix timestamp in seconds (the platform's time unit, see
+/// `_i18n_format_date` in function-registry.toml) as a locale-aware date.
 pub fn format_date(timestamp_seconds: f64, style: &str, locale: &str) -> String {
     if timestamp_seconds.is_nan() || timestamp_seconds.is_infinite() {
         return "Invalid Date".to_string();
@@ -909,6 +909,24 @@ mod tests {
             .load_json("en", r#"{"common": {"save": "Save"}}"#)
             .unwrap();
         assert_eq!(state.translate("common.save", "en", "{}"), "Save");
+    }
+
+    #[test]
+    fn test_default_locale_and_fallback_from_startup() {
+        // frame.locale startup: load default (fr), load fallback (en), select fr.
+        let mut state = LocaleState::new("en");
+        state.load_json("fr", r#"{"hello": "Bonjour"}"#).unwrap();
+        state
+            .load_json("en", r#"{"hello": "Hello", "bye": "Goodbye"}"#)
+            .unwrap();
+        state.set_default_locale("fr");
+        assert_eq!(state.default_locale, "fr");
+        assert_eq!(state.fallback_locale, "en");
+        assert_eq!(state.translate("hello", "fr", "{}"), "Bonjour");
+        // Missing from fr -> served from the fallback locale.
+        assert_eq!(state.translate("bye", "fr", "{}"), "Goodbye");
+        // Requested locale without a bundle -> default first.
+        assert_eq!(state.translate("hello", "de", "{}"), "Bonjour");
     }
 
     #[test]

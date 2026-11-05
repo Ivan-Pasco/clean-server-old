@@ -2,7 +2,7 @@
 //!
 //! Configured by `_rate_limit_configure` during WASM init. Strategy is either
 //! `ip` (key by `X-Forwarded-For`/`X-Real-IP`, falling back to a constant) or
-//! `user` (key by session cookie, falling back to ip).
+//! `user` (key by the application's session cookie, falling back to ip).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -28,6 +28,8 @@ struct BucketState {
 #[derive(Debug)]
 pub struct RateLimiter {
     config: RateLimitConfig,
+    /// Session cookie name used to key the `user` strategy.
+    session_cookie: String,
     buckets: Mutex<HashMap<String, BucketState>>,
 }
 
@@ -35,8 +37,15 @@ impl RateLimiter {
     pub fn new(config: RateLimitConfig) -> Self {
         Self {
             config,
+            session_cookie: crate::session::SessionConfig::default().cookie_name,
             buckets: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Key the `user` strategy by the application's session cookie.
+    pub fn with_session_cookie(mut self, name: impl Into<String>) -> Self {
+        self.session_cookie = name.into();
+        self
     }
 
     pub fn config(&self) -> &RateLimitConfig {
@@ -67,7 +76,7 @@ impl RateLimiter {
 pub type SharedRateLimiter = Arc<RateLimiter>;
 
 /// Derive the rate-limit key from request headers using the configured strategy.
-fn extract_key(strategy: RateLimitStrategy, headers: &HeaderMap) -> String {
+fn extract_key(strategy: RateLimitStrategy, session_cookie: &str, headers: &HeaderMap) -> String {
     fn header(headers: &HeaderMap, name: &str) -> Option<String> {
         headers
             .get(name)
@@ -76,20 +85,12 @@ fn extract_key(strategy: RateLimitStrategy, headers: &HeaderMap) -> String {
             .filter(|s| !s.is_empty())
     }
 
-    fn session_from_cookie(headers: &HeaderMap) -> Option<String> {
+    fn session_from_cookie(headers: &HeaderMap, session_cookie: &str) -> Option<String> {
         let cookie_header = headers.get(header::COOKIE)?.to_str().ok()?;
-        for part in cookie_header.split(';') {
-            let part = part.trim();
-            for name in ["session", "sid"] {
-                let prefix = format!("{}=", name);
-                if let Some(value) = part.strip_prefix(&prefix)
-                    && !value.is_empty()
-                {
-                    return Some(format!("user:{}", value));
-                }
-            }
-        }
-        None
+        crate::session::parse_cookies(cookie_header)
+            .remove(session_cookie)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("user:{}", value))
     }
 
     let ip_key = || {
@@ -101,7 +102,9 @@ fn extract_key(strategy: RateLimitStrategy, headers: &HeaderMap) -> String {
 
     match strategy {
         RateLimitStrategy::Ip => ip_key(),
-        RateLimitStrategy::User => session_from_cookie(headers).unwrap_or_else(ip_key),
+        RateLimitStrategy::User => {
+            session_from_cookie(headers, session_cookie).unwrap_or_else(ip_key)
+        }
     }
 }
 
@@ -111,7 +114,11 @@ pub async fn rate_limit_middleware(
     req: Request,
     next: Next,
 ) -> Response {
-    let key = extract_key(limiter.config().strategy, req.headers());
+    let key = extract_key(
+        limiter.config().strategy,
+        &limiter.session_cookie,
+        req.headers(),
+    );
     if limiter.allow(&key) {
         return next.run(req).await;
     }
@@ -126,4 +133,28 @@ pub async fn rate_limit_middleware(
         .header("Retry-After", retry_after)
         .body(Body::from(body))
         .expect("rate-limit response builder")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderValue;
+
+    #[test]
+    fn user_strategy_keys_by_configured_session_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_static("frame.sid=abc; sid=zzz"),
+        );
+        assert_eq!(
+            extract_key(RateLimitStrategy::User, "frame.sid", &headers),
+            "user:abc"
+        );
+        // Without the configured cookie the key falls back to the client ip.
+        assert_eq!(
+            extract_key(RateLimitStrategy::User, "app.sid", &headers),
+            "ip:unknown"
+        );
+    }
 }

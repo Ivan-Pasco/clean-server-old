@@ -121,28 +121,32 @@ fn check_bridge_permission(caller: &Caller<'_, WasmState>, func_name: &str) -> b
     caller.data().permission_gate.check(func_name)
 }
 
-/// Resolve the active session id for the current request: auth context first,
-/// then the `session` / `sid` cookie. Used by every session/auth bridge that
-/// implicitly addresses the caller's session.
+/// Resolve the active session id for the current request: the auth context
+/// first, then a session created earlier in this request, then the session
+/// cookie under the application's configured cookie name. Used by every
+/// session/auth bridge that implicitly addresses the caller's session.
 fn current_session_id(state: &WasmState) -> Option<String> {
-    state
+    if let Some(id) = state
         .auth_context
         .as_ref()
         .and_then(|ctx| ctx.session_id.clone())
-        .or_else(|| {
-            state.request_context.as_ref().and_then(|ctx| {
-                ctx.headers
-                    .iter()
-                    .find(|(k, _)| k.to_lowercase() == "cookie")
-                    .and_then(|(_, cookie_header)| {
-                        let cookies = parse_cookies(cookie_header);
-                        cookies
-                            .get("session")
-                            .cloned()
-                            .or_else(|| cookies.get("sid").cloned())
-                    })
-            })
-        })
+    {
+        return Some(id);
+    }
+    if let Some(id) = &state.request_session_id {
+        return Some(id.clone());
+    }
+    let cookie_header = state.request_context.as_ref().and_then(|ctx| {
+        ctx.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("cookie"))
+            .map(|(_, v)| v.clone())
+    })?;
+    state
+        .session_store
+        .read()
+        .expect("session store lock poisoned")
+        .session_id_from_cookie_header(&cookie_header)
 }
 
 /// Format a JSON error body in the canonical `{ok:false, err:{code, message}}` shape.
@@ -162,8 +166,15 @@ fn register_http_server_functions(linker: &mut Linker<WasmState>) -> RuntimeResu
             "env",
             "_http_listen",
             |mut caller: Caller<'_, WasmState>, port: i32| -> i32 {
-                let state = caller.data_mut();
-                state.port = port as u16;
+                if !(1..=65535).contains(&port) {
+                    error!("_http_listen: port {} out of range", port);
+                    return -1;
+                }
+                // The listener is bound after initialization from the shared
+                // runtime config, so the port must land there (the per-instance
+                // field alone dies with the init store).
+                caller.data().runtime_config.write().listen_port = Some(port as u16);
+                caller.data_mut().port = port as u16;
                 info!("HTTP server configured to listen on port {}", port);
                 0 // Return 0 for success
             },
@@ -1309,12 +1320,20 @@ fn register_session_management_functions(linker: &mut Linker<WasmState>) -> Runt
                 };
 
                 let session_store = caller.data().session_store.clone();
-                let mut store = session_store.write().expect("session store lock poisoned");
-                if store.store_raw(&session_id, &data) {
-                    1
-                } else {
-                    0
+                let stored = {
+                    let mut store = session_store.write().expect("session store lock poisoned");
+                    store.store_raw(&session_id, &data)
+                };
+                if !stored {
+                    return 0;
                 }
+                // A whole-session blob stored during a request is that request's
+                // session from here on (session_create stores it, then sets the
+                // CSRF token and the cookie in the same request).
+                if caller.data().request_context.is_some() {
+                    caller.data_mut().request_session_id = Some(session_id);
+                }
+                1
             },
         )
         .map_err(|e| RuntimeError::wasm(format!("Failed to define _session_store: {}", e)))?;
@@ -1331,27 +1350,7 @@ fn register_session_management_functions(linker: &mut Linker<WasmState>) -> Runt
                     return write_string_to_caller(&mut caller, "");
                 }
                 // Get session ID from auth context or cookie
-                let session_id = {
-                    let state = caller.data();
-                    state
-                        .auth_context
-                        .as_ref()
-                        .and_then(|ctx| ctx.session_id.clone())
-                        .or_else(|| {
-                            state.request_context.as_ref().and_then(|ctx| {
-                                ctx.headers
-                                    .iter()
-                                    .find(|(k, _)| k.to_lowercase() == "cookie")
-                                    .and_then(|(_, cookie_header)| {
-                                        let cookies = parse_cookies(cookie_header);
-                                        cookies
-                                            .get("session")
-                                            .cloned()
-                                            .or_else(|| cookies.get("sid").cloned())
-                                    })
-                            })
-                        })
-                };
+                let session_id = current_session_id(caller.data());
 
                 let session_id = match session_id {
                     Some(id) => id,
@@ -1390,32 +1389,12 @@ fn register_session_management_functions(linker: &mut Linker<WasmState>) -> Runt
         .func_wrap(
             "env",
             "_session_delete",
-            |caller: Caller<'_, WasmState>| -> i32 {
+            |mut caller: Caller<'_, WasmState>| -> i32 {
                 if !check_bridge_permission(&caller, "_session_delete") {
                     return 0;
                 }
                 // Get session ID from auth context or cookie
-                let session_id = {
-                    let state = caller.data();
-                    state
-                        .auth_context
-                        .as_ref()
-                        .and_then(|ctx| ctx.session_id.clone())
-                        .or_else(|| {
-                            state.request_context.as_ref().and_then(|ctx| {
-                                ctx.headers
-                                    .iter()
-                                    .find(|(k, _)| k.to_lowercase() == "cookie")
-                                    .and_then(|(_, cookie_header)| {
-                                        let cookies = parse_cookies(cookie_header);
-                                        cookies
-                                            .get("session")
-                                            .cloned()
-                                            .or_else(|| cookies.get("sid").cloned())
-                                    })
-                            })
-                        })
-                };
+                let session_id = current_session_id(caller.data());
 
                 let session_id = match session_id {
                     Some(id) => id,
@@ -1432,6 +1411,9 @@ fn register_session_management_functions(linker: &mut Linker<WasmState>) -> Runt
                     let mut store = session_store.write().expect("session store lock poisoned");
                     store.delete_raw(&session_id)
                 };
+                if caller.data().request_session_id.as_deref() == Some(session_id.as_str()) {
+                    caller.data_mut().request_session_id = None;
+                }
 
                 if deleted { 1 } else { 0 }
             },
@@ -1478,27 +1460,7 @@ fn register_session_management_functions(linker: &mut Linker<WasmState>) -> Runt
                 };
 
                 // Get current session ID from auth context or cookie
-                let session_id = {
-                    let state = caller.data();
-                    state
-                        .auth_context
-                        .as_ref()
-                        .and_then(|ctx| ctx.session_id.clone())
-                        .or_else(|| {
-                            state.request_context.as_ref().and_then(|ctx| {
-                                ctx.headers
-                                    .iter()
-                                    .find(|(k, _)| k.to_lowercase() == "cookie")
-                                    .and_then(|(_, cookie_header)| {
-                                        let cookies = parse_cookies(cookie_header);
-                                        cookies
-                                            .get("session")
-                                            .cloned()
-                                            .or_else(|| cookies.get("sid").cloned())
-                                    })
-                            })
-                        })
-                };
+                let session_id = current_session_id(caller.data());
 
                 let session_id = match session_id {
                     Some(id) => id,
@@ -1525,27 +1487,7 @@ fn register_session_management_functions(linker: &mut Linker<WasmState>) -> Runt
             "_session_get_csrf",
             |mut caller: Caller<'_, WasmState>| -> i32 {
                 // Get current session ID from auth context or cookie
-                let session_id = {
-                    let state = caller.data();
-                    state
-                        .auth_context
-                        .as_ref()
-                        .and_then(|ctx| ctx.session_id.clone())
-                        .or_else(|| {
-                            state.request_context.as_ref().and_then(|ctx| {
-                                ctx.headers
-                                    .iter()
-                                    .find(|(k, _)| k.to_lowercase() == "cookie")
-                                    .and_then(|(_, cookie_header)| {
-                                        let cookies = parse_cookies(cookie_header);
-                                        cookies
-                                            .get("session")
-                                            .cloned()
-                                            .or_else(|| cookies.get("sid").cloned())
-                                    })
-                            })
-                        })
-                };
+                let session_id = current_session_id(caller.data());
 
                 let session_id = match session_id {
                     Some(id) => id,
@@ -1886,27 +1828,7 @@ fn register_session_auth_functions(linker: &mut Linker<WasmState>) -> RuntimeRes
                 if !check_bridge_permission(&caller, "_auth_clear_session") {
                     return 0;
                 }
-                let session_id = {
-                    let state = caller.data();
-                    state
-                        .auth_context
-                        .as_ref()
-                        .and_then(|ctx| ctx.session_id.clone())
-                        .or_else(|| {
-                            state.request_context.as_ref().and_then(|ctx| {
-                                ctx.headers
-                                    .iter()
-                                    .find(|(k, _)| k.to_lowercase() == "cookie")
-                                    .and_then(|(_, cookie_header)| {
-                                        let cookies = parse_cookies(cookie_header);
-                                        cookies
-                                            .get("session")
-                                            .cloned()
-                                            .or_else(|| cookies.get("sid").cloned())
-                                    })
-                            })
-                        })
-                };
+                let session_id = current_session_id(caller.data());
 
                 let session_id = match session_id {
                     Some(id) => id,
@@ -1922,7 +1844,7 @@ fn register_session_auth_functions(linker: &mut Linker<WasmState>) -> RuntimeRes
 
                 {
                     let mut store = session_store.write().expect("session store lock poisoned");
-                    store.delete(&session_id);
+                    store.delete_raw(&session_id);
                 }
 
                 let clear_cookie = {
@@ -1932,6 +1854,7 @@ fn register_session_auth_functions(linker: &mut Linker<WasmState>) -> RuntimeRes
 
                 caller.data_mut().pending_set_cookie = Some(clear_cookie);
                 caller.data_mut().auth_context = None;
+                caller.data_mut().request_session_id = None;
 
                 1
             },
@@ -5227,6 +5150,7 @@ fn register_mcp_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> {
             }
         };
         *mcp.current_http_response.lock().expect("mcp response lock") = Some(request.response_tx);
+        *mcp.current_http_headers.lock().expect("mcp headers lock") = request.headers;
         debug!(
             "_mcp_http_accept: received request {} bytes",
             request.body.len()
@@ -5268,6 +5192,51 @@ fn register_mcp_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> {
                 0
             }
         }
+    });
+
+    // _mcp_http_header — value of a header of the request returned by the most
+    // recent _mcp_http_accept (case-insensitive name); "" when absent.
+    register_bridge_fn!(linker, "_mcp_http_header", |mut caller: Caller<
+        '_,
+        WasmState,
+    >,
+                                                     name_ptr: i32,
+                                                     name_len: i32|
+     -> i32 {
+        let name = read_raw_string(&mut caller, name_ptr, name_len)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let value = caller
+            .data()
+            .mcp
+            .current_http_headers
+            .lock()
+            .expect("mcp headers lock")
+            .iter()
+            .find(|(k, _)| *k == name)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default();
+        write_string_to_caller(&mut caller, &value)
+    });
+
+    // _mcp_http_require_key — require `Authorization: Bearer <key>` on every
+    // MCP HTTP request (frame.mcp `apiKey:`). Requests without the key are
+    // answered 401 by the host and never reach the module. An empty key is
+    // rejected (returns 0) so a missing env var cannot silently disable auth.
+    register_bridge_fn!(linker, "_mcp_http_require_key", |mut caller: Caller<
+        '_,
+        WasmState,
+    >,
+                                                          key_ptr: i32,
+                                                          key_len: i32|
+     -> i32 {
+        let key = read_raw_string(&mut caller, key_ptr, key_len).unwrap_or_default();
+        if key.is_empty() {
+            error!("_mcp_http_require_key: empty API key");
+            return 0;
+        }
+        *caller.data().mcp.api_key.lock().expect("mcp api key lock") = Some(key);
+        1
     });
 
     // _mcp_sse_send — send raw SSE-formatted event to a specific connected client
@@ -5353,7 +5322,10 @@ async fn run_mcp_http_server(addr: String, mcp: McpAxumState) {
         ])
         .allow_headers(Any);
 
+    // JSON-RPC arrives as POST / (frame.mcp spec §8.2); /mcp stays served
+    // for clients configured with the older endpoint.
     let app = Router::new()
+        .route("/", post(handle_mcp_post))
         .route("/mcp", post(handle_mcp_post))
         .route("/sse", get(handle_mcp_sse))
         .layer(cors)
@@ -5373,11 +5345,46 @@ async fn run_mcp_http_server(addr: String, mcp: McpAxumState) {
     }
 }
 
-/// Handle POST /mcp — queue the request body for the WASM module, await the response.
+/// `true` when `headers` carry `Authorization: Bearer <key>` for the
+/// configured key (constant-time comparison).
+fn mcp_request_authorized(headers: &axum::http::HeaderMap, key: &str) -> bool {
+    let presented = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or("");
+    let (a, b) = (presented.as_bytes(), key.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Handle POST / (and /mcp) — queue the request for the WASM module, await the response.
 async fn handle_mcp_post(
     axum::extract::State(mcp): axum::extract::State<McpAxumState>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
+    let required_key = mcp.api_key.lock().expect("mcp api key lock").clone();
+    if let Some(key) = required_key
+        && !mcp_request_authorized(&headers, &key)
+    {
+        return axum::response::Response::builder()
+            .status(axum::http::StatusCode::UNAUTHORIZED)
+            .header("Content-Type", "application/json")
+            .header("WWW-Authenticate", "Bearer")
+            .body(axum::body::Body::from(
+                r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"Unauthorized"}}"#,
+            ))
+            .expect("valid MCP 401 response");
+    }
+    let header_vec: Vec<(String, String)> = headers
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str()
+                .ok()
+                .map(|v| (k.as_str().to_ascii_lowercase(), v.to_string()))
+        })
+        .collect();
     let body_str = String::from_utf8_lossy(&body).into_owned();
     let session_id = uuid::Uuid::new_v4().to_string();
 
@@ -5387,6 +5394,7 @@ async fn handle_mcp_post(
         let mut queue = queue_mutex.lock().expect("mcp queue lock");
         queue.push_back(McpPendingRequest {
             body: body_str,
+            headers: header_vec,
             response_tx: tx,
         });
         condvar.notify_one();
@@ -6360,7 +6368,8 @@ fn register_jobs_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
     // _job_register — register a job handler with retry policy (no dot alias)
     // Signature: (name_ptr, name_len, handler_ptr, handler_len,
     //             maxAttempts: i32, backoff_ptr, backoff_len,
-    //             delay: i32, timeout: i32, queue_ptr, queue_len) -> void
+    //             delaySeconds: i32, timeoutSeconds: i32, queue_ptr, queue_len) -> void
+    // Durations arrive in seconds and are stored in milliseconds.
     // -----------------------------------------------------------------------
     linker
         .func_wrap(
@@ -6407,8 +6416,8 @@ fn register_jobs_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
                         handler,
                         max_attempts.max(1) as u32,
                         backoff,
-                        delay.max(0) as u64,
-                        timeout.max(0) as u64,
+                        jobs::seconds_to_ms(f64::from(delay)),
+                        jobs::seconds_to_ms(f64::from(timeout)),
                         queue,
                     ))
                 });
@@ -6449,7 +6458,7 @@ fn register_jobs_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
 
     // -----------------------------------------------------------------------
     // _job_enqueue_at — schedule a job for a specific future time
-    // Signature: (name_ptr, name_len, argsJson_ptr, argsJson_len, runAtUnixMs: f64) -> i32 (LP string)
+    // Signature: (name_ptr, name_len, argsJson_ptr, argsJson_len, runAtUnixSeconds: f64) -> i32 (LP string)
     // plugin.toml declares the 3rd param as "number" which expands to WASM f64.
     // f64 can represent Unix epoch milliseconds with 53-bit integer precision —
     // sufficient for any realistic scheduling horizon.
@@ -6462,7 +6471,7 @@ fn register_jobs_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
                                                     name_len: i32,
                                                     args_ptr: i32,
                                                     args_len: i32,
-                                                    run_at_ms: f64|
+                                                    run_at_seconds: f64|
      -> i32 {
         let name = match read_raw_string(&mut caller, name_ptr, name_len) {
             Some(s) => s,
@@ -6474,13 +6483,9 @@ fn register_jobs_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
         let args =
             read_raw_string(&mut caller, args_ptr, args_len).unwrap_or_else(|| "{}".to_string());
 
-        // Cast f64 Unix-epoch milliseconds to u64 for internal storage.
-        // Negative or NaN values are clamped to 0 (enqueue immediately).
-        let run_at_u64 = if run_at_ms.is_nan() || run_at_ms < 0.0 {
-            0u64
-        } else {
-            run_at_ms as u64
-        };
+        // Unix-epoch seconds in, milliseconds stored. Negative or NaN values
+        // clamp to 0 (enqueue immediately).
+        let run_at_u64 = jobs::seconds_to_ms(run_at_seconds);
 
         let jobs_state = caller.data().jobs_state.clone();
         let job_id = tokio::task::block_in_place(|| {
@@ -6617,13 +6622,13 @@ fn register_jobs_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
 
     // -----------------------------------------------------------------------
     // _job_retry_after — request retry after a custom delay (overrides backoff)
-    // Signature: (delayMs: i32) -> void
+    // Signature: (delaySeconds: i32) -> void
     // -----------------------------------------------------------------------
     register_bridge_fn!(
         linker,
         "_job_retry_after",
-        |_caller: Caller<'_, WasmState>, delay_ms: i32| {
-            jobs::request_retry_after_ms(delay_ms as i64);
+        |_caller: Caller<'_, WasmState>, delay_seconds: i32| {
+            jobs::request_retry_after_ms(jobs::seconds_to_ms(f64::from(delay_seconds)) as i64);
         }
     );
 
@@ -6746,6 +6751,73 @@ fn register_jobs_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
     Ok(())
 }
 
+/// The locale in effect for the current call: the one selected with
+/// `_i18n_set_locale` during this request, else the one the request asks for
+/// (HOST_BRIDGE.md detection order: `?locale=` query parameter, `cl_locale`
+/// cookie, `Accept-Language` header), else the module's default locale.
+fn active_locale(state: &WasmState) -> String {
+    if let Some(locale) = &state.active_locale {
+        return locale.clone();
+    }
+    let locale_state = state.locale_state.clone();
+    let locale_state = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async { locale_state.read_owned().await })
+    });
+    state
+        .request_context
+        .as_ref()
+        .and_then(|req| requested_locale(req, &locale_state))
+        .unwrap_or_else(|| locale_state.default_locale.clone())
+}
+
+/// The locale a request asks for, per the server detection order. Query and
+/// cookie values are taken as given; `Accept-Language` entries are matched
+/// (in preference order) against the locales whose translations are loaded.
+fn requested_locale(
+    req: &crate::wasm::RequestContext,
+    locale_state: &crate::locale::LocaleState,
+) -> Option<String> {
+    if let Some(q) = req.query.get("locale").filter(|v| !v.trim().is_empty()) {
+        return Some(q.trim().to_string());
+    }
+    let header = |name: &str| {
+        req.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    };
+    if let Some(c) = header("cookie")
+        .and_then(|h| parse_cookies(h).remove("cl_locale"))
+        .filter(|v| !v.is_empty())
+    {
+        return Some(c);
+    }
+    let accept = header("accept-language")?;
+    let mut ranked: Vec<(f32, &str)> = accept
+        .split(',')
+        .filter_map(|part| {
+            let mut pieces = part.split(';');
+            let tag = pieces.next()?.trim();
+            let q = pieces
+                .find_map(|p| p.trim().strip_prefix("q="))
+                .and_then(|q| q.parse::<f32>().ok())
+                .unwrap_or(1.0);
+            (!tag.is_empty() && tag != "*" && q > 0.0).then_some((q, tag))
+        })
+        .collect();
+    ranked.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.into_iter().find_map(|(_, tag)| {
+        if locale_state.translations.contains_key(tag) {
+            return Some(tag.to_string());
+        }
+        let primary = tag.split('-').next().unwrap_or(tag);
+        locale_state
+            .translations
+            .contains_key(primary)
+            .then(|| primary.to_string())
+    })
+}
+
 /// Register i18n / locale bridge functions (8 functions, frame.locale contract).
 ///
 /// All 7 "all-host" functions are registered plus `_i18n_load` (server-only).
@@ -6753,8 +6825,10 @@ fn register_jobs_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
 /// Additional spec-defined aliases (`t`, `tc`, `locale.*`) are added in `register_dot_aliases`.
 ///
 /// Translation data is stored in `WasmState.locale_state` (a `SharedLocaleState`).
-/// The active locale for each request is stored in `crate::locale::LOCALE` task-local;
-/// `_i18n_set_locale` writes it and all lookup functions read it.
+/// The active locale for each request is `WasmState.active_locale` (each request
+/// runs in a fresh store); `_i18n_set_locale` writes it and all lookup functions
+/// read it through `active_locale`. Called during startup, `_i18n_set_locale`
+/// also sets the module's default locale.
 fn register_locale_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> {
     use crate::locale;
 
@@ -6832,17 +6906,17 @@ fn register_locale_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()
                     return;
                 }
             };
-            if !locale::set_current_locale(locale_tag.clone()) {
-                // Called outside a LOCALE task-local scope — fall back to storing
-                // the locale in a request header slot so middleware can retrieve it.
-                warn!("_i18n_set_locale: called outside LOCALE scope; storing in state");
-                // Store as a synthetic pending header so the router middleware can
-                // access it on the next lookup. The store field is used as a scratchpad.
-                caller
-                    .data_mut()
-                    .pending_headers
-                    .push(("x-cl-locale-requested".to_string(), locale_tag.clone()));
+            if caller.data().initializing {
+                // At startup (frame.locale emits `_i18n_set_locale(default)`
+                // into the entry point) the call sets the module's default.
+                let locale_state = caller.data().locale_state.clone();
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        locale_state.write().await.set_default_locale(&locale_tag);
+                    })
+                });
             }
+            caller.data_mut().active_locale = Some(locale_tag.clone());
             let is_rtl = locale::is_rtl(&locale_tag);
             if is_rtl {
                 // Server-side RTL: schedule data-locale-dir="rtl" header for the renderer.
@@ -6864,24 +6938,8 @@ fn register_locale_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()
         WasmState,
     >|
      -> i32 {
-        // Read from task-local first.
-        let locale_tag = locale::current_locale();
-        if !locale_tag.is_empty() {
-            return write_string_to_caller(&mut caller, &locale_tag);
-        }
-        // Fall back to the configured default locale.
-        let default = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                caller
-                    .data()
-                    .locale_state
-                    .read()
-                    .await
-                    .default_locale
-                    .clone()
-            })
-        });
-        write_string_to_caller(&mut caller, &default)
+        let locale_tag = active_locale(caller.data());
+        write_string_to_caller(&mut caller, &locale_tag)
     });
 
     // -----------------------------------------------------------------------
@@ -6904,15 +6962,10 @@ fn register_locale_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()
         let params = read_raw_string(&mut caller, params_ptr, params_len)
             .unwrap_or_else(|| "{}".to_string());
 
-        let active_locale = locale::current_locale();
+        let locale = active_locale(caller.data());
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let state = caller.data().locale_state.read().await;
-                let locale = if active_locale.is_empty() {
-                    state.default_locale.clone()
-                } else {
-                    active_locale.clone()
-                };
                 state.translate(&key, &locale, &params)
             })
         });
@@ -6944,15 +6997,10 @@ fn register_locale_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()
         let params = read_raw_string(&mut caller, params_ptr, params_len)
             .unwrap_or_else(|| "{}".to_string());
 
-        let active_locale = locale::current_locale();
+        let locale = active_locale(caller.data());
         let result = tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
                 let state = caller.data().locale_state.read().await;
-                let locale = if active_locale.is_empty() {
-                    state.default_locale.clone()
-                } else {
-                    active_locale.clone()
-                };
                 state.translate_count(&key, count as i32, &locale, &params)
             })
         });
@@ -6978,22 +7026,7 @@ fn register_locale_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()
             .unwrap_or_else(|| "{}".to_string());
 
         let effective_locale = if locale_arg.is_empty() {
-            let active = locale::current_locale();
-            if active.is_empty() {
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        caller
-                            .data()
-                            .locale_state
-                            .read()
-                            .await
-                            .default_locale
-                            .clone()
-                    })
-                })
-            } else {
-                active
-            }
+            active_locale(caller.data())
         } else {
             locale_arg
         };
@@ -7027,22 +7060,7 @@ fn register_locale_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()
         let locale_arg = read_raw_string(&mut caller, locale_ptr, locale_len).unwrap_or_default();
 
         let effective_locale = if locale_arg.is_empty() {
-            let active = locale::current_locale();
-            if active.is_empty() {
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        caller
-                            .data()
-                            .locale_state
-                            .read()
-                            .await
-                            .default_locale
-                            .clone()
-                    })
-                })
-            } else {
-                active
-            }
+            active_locale(caller.data())
         } else {
             locale_arg
         };
@@ -7052,11 +7070,10 @@ fn register_locale_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()
     });
 
     // -----------------------------------------------------------------------
-    // _i18n_format_date — format a Unix timestamp as a locale-aware date string
+    // _i18n_format_date — format a Unix timestamp (seconds) as a locale-aware date string
     // Signature: (timestamp: f64, style_ptr, style_len, locale_ptr, locale_len) -> i32
-    // `timestamp` is Unix seconds (f64). HOST_BRIDGE.md § i18n states seconds;
-    // the spec cross-reference in the task says milliseconds for Intl.DateTimeFormat —
-    // server-side we use seconds (chrono) which is what the spec says for Rust.
+    // `timestamp` is Unix seconds (f64), per function-registry.toml —
+    // the platform measures time in seconds, like `_time_now`.
     // -----------------------------------------------------------------------
     register_bridge_fn!(linker, "_i18n_format_date", |mut caller: Caller<
         '_,
@@ -7073,22 +7090,7 @@ fn register_locale_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()
         let locale_arg = read_raw_string(&mut caller, locale_ptr, locale_len).unwrap_or_default();
 
         let effective_locale = if locale_arg.is_empty() {
-            let active = locale::current_locale();
-            if active.is_empty() {
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        caller
-                            .data()
-                            .locale_state
-                            .read()
-                            .await
-                            .default_locale
-                            .clone()
-                    })
-                })
-            } else {
-                active
-            }
+            active_locale(caller.data())
         } else {
             locale_arg
         };

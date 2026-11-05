@@ -87,6 +87,140 @@ impl Default for SessionConfig {
     }
 }
 
+impl SessionConfig {
+    /// Build a session configuration from a `Set-Cookie` value such as
+    /// `app.sid=abc; Path=/; SameSite=Lax; Secure; HttpOnly; Max-Age=300`.
+    ///
+    /// This is how the host learns an application's `auth: session:` settings:
+    /// frame.auth bakes them into the cookie header its generated
+    /// `__auth_build_cookie_header` helper returns. Attributes that are absent
+    /// take their `SessionConfig::default()` value, except the boolean flags,
+    /// whose absence means `false`. Returns `None` when there is no cookie name.
+    pub fn from_set_cookie(header: &str) -> Option<Self> {
+        let mut parts = header.split(';');
+        let name_value = parts.next()?.trim();
+        let name = name_value.split('=').next()?.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let mut config = SessionConfig {
+            cookie_name: name.to_string(),
+            secure: false,
+            http_only: false,
+            ..SessionConfig::default()
+        };
+        for attr in parts {
+            let attr = attr.trim();
+            let (key, value) = match attr.split_once('=') {
+                Some((k, v)) => (k.trim(), v.trim()),
+                None => (attr, ""),
+            };
+            match key.to_ascii_lowercase().as_str() {
+                "path" if !value.is_empty() => config.cookie_path = value.to_string(),
+                "samesite" if !value.is_empty() => config.same_site = value.to_string(),
+                "secure" => config.secure = true,
+                "httponly" => config.http_only = true,
+                "max-age" => {
+                    if let Ok(secs) = value.parse::<u64>() {
+                        config.timeout_seconds = secs;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Some(config)
+    }
+}
+
+/// The identity a session carries: who the user is and which role they hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionIdentity {
+    pub user_id: i32,
+    pub role: String,
+}
+
+/// Extract the identity from a raw session blob as stored by frame.auth's
+/// `session_create` helper: `{"userId":7,"claims":{"role":"user"},"expiry":...}`.
+///
+/// The user id is `userId` (or `user_id`); the role is `claims.role`, falling
+/// back to a top-level `role`. `claims` may be an object or a JSON string.
+/// Returns `None` for blobs without a user id or whose `expiry` has passed.
+/// `expiry` is a Unix timestamp; values above 10^11 are read as milliseconds.
+pub fn identity_from_session_json(data: &str) -> Option<SessionIdentity> {
+    let value: serde_json::Value = serde_json::from_str(data).ok()?;
+    let user_id = value
+        .get("userId")
+        .or_else(|| value.get("user_id"))
+        .and_then(json_to_i64)?;
+    if let Some(expiry) = value.get("expiry").and_then(json_to_i64)
+        && expiry > 0
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let now = if expiry > 100_000_000_000 {
+            now.as_millis() as i64
+        } else {
+            now.as_secs() as i64
+        };
+        if now > expiry {
+            return None;
+        }
+    }
+    let claims = match value.get("claims") {
+        Some(serde_json::Value::String(s)) => serde_json::from_str(s).ok(),
+        Some(v) => Some(v.clone()),
+        None => None,
+    };
+    let role = claims
+        .as_ref()
+        .and_then(|c| c.get("role"))
+        .or_else(|| value.get("role"))
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(SessionIdentity {
+        user_id: i32::try_from(user_id).ok()?,
+        role,
+    })
+}
+
+/// Extract the identity from a verified JWT payload: the user id is `sub`
+/// (or `userId` / `user_id`), the role is `role`. frame.auth's `jwt.sign`
+/// nests the application claims under a `claims` object next to the
+/// registered `iat` / `exp` / `jti`; those nested claims are read first.
+pub fn identity_from_jwt_claims(claims_json: &str) -> Option<SessionIdentity> {
+    let payload: serde_json::Value = serde_json::from_str(claims_json).ok()?;
+    let value = match payload.get("claims") {
+        Some(serde_json::Value::Object(_)) => payload.get("claims")?.clone(),
+        Some(serde_json::Value::String(s)) => serde_json::from_str(s).ok()?,
+        _ => payload,
+    };
+    let user_id = value
+        .get("sub")
+        .or_else(|| value.get("userId"))
+        .or_else(|| value.get("user_id"))
+        .and_then(json_to_i64)?;
+    let role = value
+        .get("role")
+        .and_then(|r| r.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(SessionIdentity {
+        user_id: i32::try_from(user_id).ok()?,
+        role,
+    })
+}
+
+/// Read an integer that may be encoded as a JSON number or numeric string.
+fn json_to_i64(v: &serde_json::Value) -> Option<i64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_i64().or_else(|| n.as_f64().map(|f| f as i64)),
+        serde_json::Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 /// In-memory session store
 pub struct SessionStore {
     /// Sessions indexed by session ID (typed sessions for auth flow)
@@ -156,6 +290,41 @@ impl SessionStore {
     /// Get session configuration
     pub fn config(&self) -> &SessionConfig {
         &self.config
+    }
+
+    /// Replace the session configuration (cookie name, attributes, timeout).
+    /// Called once at startup with the application's `auth: session:` settings.
+    pub fn set_config(&mut self, config: SessionConfig) {
+        info!(
+            "Session cookie '{}' (timeout {}s)",
+            config.cookie_name, config.timeout_seconds
+        );
+        self.config = config;
+    }
+
+    /// The session id carried by a `Cookie` request header, read from the
+    /// configured session cookie name.
+    pub fn session_id_from_cookie_header(&self, cookie_header: &str) -> Option<String> {
+        parse_cookies(cookie_header)
+            .remove(&self.config.cookie_name)
+            .filter(|id| !id.is_empty())
+    }
+
+    /// Resolve the identity of a live session: a typed session (created by
+    /// `_auth_set_session`) or a raw session blob (stored by `_session_store`).
+    /// Both are touched; expired entries are removed and yield `None`.
+    pub fn identity(&mut self, session_id: &str) -> Option<SessionIdentity> {
+        if let Some(session) = self.get(session_id) {
+            return Some(SessionIdentity {
+                user_id: session.user_id,
+                role: session.role,
+            });
+        }
+        if !self.raw_data.contains_key(session_id) {
+            return None;
+        }
+        let data = self.get_raw(session_id)?;
+        identity_from_session_json(&data)
     }
 
     /// Format a Set-Cookie header for the session
@@ -501,6 +670,122 @@ mod tests {
         assert!(store.store_reset_token(&hash, 7, Duration::from_millis(0)));
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(store.consume_reset_token(&hash), None);
+    }
+
+    #[test]
+    fn test_config_from_set_cookie() {
+        let cfg = SessionConfig::from_set_cookie(
+            "app.sid=probe; Path=/app; SameSite=Strict; Secure; HttpOnly; Max-Age=300",
+        )
+        .expect("config");
+        assert_eq!(cfg.cookie_name, "app.sid");
+        assert_eq!(cfg.cookie_path, "/app");
+        assert_eq!(cfg.same_site, "Strict");
+        assert!(cfg.secure);
+        assert!(cfg.http_only);
+        assert_eq!(cfg.timeout_seconds, 300);
+
+        let plain =
+            SessionConfig::from_set_cookie("frame.sid=x; Path=/; SameSite=Lax").expect("config");
+        assert_eq!(plain.cookie_name, "frame.sid");
+        assert!(!plain.secure);
+        assert!(!plain.http_only);
+        assert!(SessionConfig::from_set_cookie("=x; Path=/").is_none());
+    }
+
+    #[test]
+    fn test_session_id_from_configured_cookie() {
+        let mut store = SessionStore::new(SessionConfig::default());
+        store.set_config(SessionConfig {
+            cookie_name: "frame.sid".to_string(),
+            ..SessionConfig::default()
+        });
+        assert_eq!(
+            store.session_id_from_cookie_header("theme=dark; frame.sid=abc"),
+            Some("abc".to_string())
+        );
+        // A cookie under another name is not the session cookie.
+        assert_eq!(store.session_id_from_cookie_header("session=abc"), None);
+    }
+
+    #[test]
+    fn test_identity_from_raw_session_blob() {
+        let mut store = SessionStore::new(SessionConfig::default());
+        store.store_raw(
+            "sid-1",
+            r#"{"userId":7,"claims":{"role":"user"},"expiry":0}"#,
+        );
+        assert_eq!(
+            store.identity("sid-1"),
+            Some(SessionIdentity {
+                user_id: 7,
+                role: "user".to_string()
+            })
+        );
+        assert_eq!(store.identity("missing"), None);
+    }
+
+    #[test]
+    fn test_identity_from_typed_session() {
+        let mut store = SessionStore::new(SessionConfig::default());
+        let session = store.create(3, "admin", "{}");
+        assert_eq!(
+            store.identity(&session.session_id),
+            Some(SessionIdentity {
+                user_id: 3,
+                role: "admin".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn test_identity_rejects_expired_or_anonymous_blob() {
+        // expiry in seconds, in the past
+        assert_eq!(
+            identity_from_session_json(r#"{"userId":1,"claims":{},"expiry":1000}"#),
+            None
+        );
+        // expiry in milliseconds, in the future
+        let future_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            + 60_000) as i64;
+        let blob = format!(r#"{{"userId":1,"claims":"{{\"role\":\"x\"}}","expiry":{future_ms}}}"#);
+        assert_eq!(
+            identity_from_session_json(&blob),
+            Some(SessionIdentity {
+                user_id: 1,
+                role: "x".to_string()
+            })
+        );
+        assert_eq!(identity_from_session_json(r#"{"claims":{}}"#), None);
+    }
+
+    #[test]
+    fn test_identity_from_jwt_claims() {
+        assert_eq!(
+            identity_from_jwt_claims(r#"{"sub":7,"role":"user","exp":1}"#),
+            Some(SessionIdentity {
+                user_id: 7,
+                role: "user".to_string()
+            })
+        );
+        assert_eq!(
+            identity_from_jwt_claims(r#"{"sub":"42"}"#).map(|i| i.user_id),
+            Some(42)
+        );
+        assert_eq!(identity_from_jwt_claims(r#"{"role":"user"}"#), None);
+        // frame.auth jwt.sign payload: application claims nested under `claims`.
+        assert_eq!(
+            identity_from_jwt_claims(
+                r#"{"iat":1,"exp":2,"jti":"x","claims":{"sub":7,"role":"user"}}"#
+            ),
+            Some(SessionIdentity {
+                user_id: 7,
+                role: "user".to_string()
+            })
+        );
     }
 
     #[test]
