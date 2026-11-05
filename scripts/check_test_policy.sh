@@ -268,7 +268,7 @@ check_p6() {
   while IFS= read -r f; do
     [[ -z "$f" ]] && continue
     base="$(basename "$f")"
-    if grep -qE '^[[:space:]]*#\[(tokio::)?test\]' "$f" 2>/dev/null; then continue; fi
+    if grep -qE '^[[:space:]]*#\[(tokio::)?test(\(.*\))?\]' "$f" 2>/dev/null; then continue; fi
     if allowlist_contains "P6" "tests/$base"; then continue; fi
     record "P6 tests/$base — no #[test] or #[tokio::test] function found"
   done < <(find tests -maxdepth 1 -type f -name '*.rs' 2>/dev/null || true)
