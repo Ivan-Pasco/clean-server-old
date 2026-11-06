@@ -199,11 +199,7 @@ pub fn read_string_from_memory<T>(
             debug!(
                 "read_string_from_memory: successfully read {} bytes: '{}'",
                 len,
-                if s.len() > 100 {
-                    format!("{}...", &s[..100])
-                } else {
-                    s.to_string()
-                }
+                log_preview(s, 100)
             );
             Ok(s.to_string())
         }
@@ -478,5 +474,51 @@ mod tests {
 
         mem.reset();
         assert_eq!(mem.grow_count(), 0);
+    }
+}
+
+/// Shortens `s` to at most `max_bytes` bytes for a log line, adding "..."
+/// when cut. Cuts only on a character boundary: slicing a `&str` inside a
+/// multi-byte character (an em dash, an accented letter) panics.
+pub fn log_preview(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
+}
+
+#[cfg(test)]
+mod log_preview_tests {
+    use super::log_preview;
+
+    #[test]
+    fn short_text_is_kept_whole() {
+        assert_eq!(log_preview("hola", 200), "hola");
+    }
+
+    #[test]
+    fn ascii_text_is_cut_at_the_limit() {
+        assert_eq!(log_preview("abcdef", 3), "abc...");
+    }
+
+    #[test]
+    fn cut_inside_a_multibyte_character_moves_back_to_its_start() {
+        // "—" is 3 bytes; byte 200 falls inside it, as in the Spanish
+        // tutorials index that crashed `_json_get`'s log line.
+        let text = format!("{}—resto", "a".repeat(199));
+        assert_eq!(log_preview(&text, 200), format!("{}...", "a".repeat(199)));
+    }
+
+    #[test]
+    fn accented_text_never_panics_at_any_limit() {
+        let text = "Programación con IA — información útil";
+        for limit in 0..text.len() {
+            let out = log_preview(text, limit);
+            assert!(out.len() <= limit + 3, "limit {limit} gave {out:?}");
+        }
     }
 }

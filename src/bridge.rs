@@ -3173,7 +3173,7 @@ fn register_json_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
                 // (b) _json_get is never being called and json.get is going
                 // through a different path (compiler stdlib json.decode).
                 // This entry log fires no matter what happens inside.
-                info!(
+                debug!(
                     "DIAG-JSON-GET-ENTRY any_ptr={} path_ptr={}",
                     any_ptr, path_ptr
                 );
@@ -3272,19 +3272,16 @@ fn register_json_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
                 };
 
                 // DIAG-JSON-GET: log the tuple (tag, path, source_bytes, result)
-                // at info level so we can reconcile _db_query envelope shape
-                // against _json_get traversal without RUST_LOG=debug. Companion
-                // to DIAG-DB-QUERY-SHAPE. See prompt 1c2d7544.
-                info!(
+                // so _db_query envelope shape can be reconciled against
+                // _json_get traversal. Debug level: at info it wrote every
+                // value an app reads (user data included) into the server log
+                // on every request. Companion to DIAG-DB-QUERY-SHAPE.
+                debug!(
                     "DIAG-JSON-GET tag={} path={:?} source_bytes={} source={} result={:?}",
                     tag,
                     path,
                     json_str.len(),
-                    if json_str.len() > 200 {
-                        format!("{}...", &json_str[..200])
-                    } else {
-                        json_str.clone()
-                    },
+                    crate::memory::log_preview(&json_str, 200),
                     result
                 );
                 debug!("_json_get: path='{}' -> '{}'", path, result);

@@ -1,6 +1,6 @@
 [package]
 name = "clean-server"
-version = "1.9.115"
+version = "1.9.116"
 edition = "2024"
 authors = ["Ivan Pasco"]
 license = "MIT OR Apache-2.0"
