@@ -36,7 +36,7 @@ jobs:
             asset_name: clean-server-darwin-x64
 
           # macOS ARM64 (Apple Silicon)
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             artifact_name: clean-server
             asset_name: clean-server-darwin-arm64
