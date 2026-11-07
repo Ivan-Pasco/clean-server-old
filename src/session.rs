@@ -371,6 +371,15 @@ impl SessionStore {
         attrs
     }
 
+    /// Whether a `Set-Cookie` value sets (or clears) the session cookie.
+    pub fn is_session_cookie(&self, set_cookie: &str) -> bool {
+        set_cookie
+            .split(';')
+            .next()
+            .and_then(|name_value| name_value.split('=').next())
+            .is_some_and(|name| name.trim() == self.config.cookie_name)
+    }
+
     // =========================================
     // RAW KEY-VALUE SESSION STORAGE
     // =========================================
@@ -846,5 +855,17 @@ mod tests {
 
         let host_only = SessionConfig::from_set_cookie("app.sid=x; Path=/").expect("config");
         assert_eq!(host_only.domain, None);
+    }
+
+    #[test]
+    fn test_is_session_cookie() {
+        let store = SessionStore::new(SessionConfig {
+            cookie_name: "app.sid".to_string(),
+            ..SessionConfig::default()
+        });
+        assert!(store.is_session_cookie("app.sid=abc; Path=/"));
+        assert!(store.is_session_cookie("app.sid=; Max-Age=0"));
+        assert!(!store.is_session_cookie("frame.refresh=abc; Path=/"));
+        assert!(!store.is_session_cookie("app.sid2=abc"));
     }
 }

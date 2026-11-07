@@ -1107,6 +1107,9 @@ async fn handle_request_inner(
         }
     }
 
+    // The session the request's cookie resolved, kept alive below.
+    let cookie_session_id = auth_context.as_ref().and_then(|a| a.session_id.clone());
+
     // Parse query parameters
     let query_params: HashMap<String, String> =
         url::form_urlencoded::parse(query_string.as_bytes())
@@ -1254,7 +1257,12 @@ async fn handle_request_inner(
         .wasm
         .call_handler_with_auth(&route_handler.handler_name, request_ctx, auth_context)
     {
-        Ok(handler_response) => handler_response_to_axum_response(handler_response),
+        Ok(mut handler_response) => {
+            if let Some(session_id) = &cookie_session_id {
+                keep_session_cookie_alive(&mut handler_response, session_id, &state.wasm);
+            }
+            handler_response_to_axum_response(handler_response)
+        }
         Err(e) => {
             error!("Handler error: {}", e);
 
@@ -1367,6 +1375,36 @@ fn handler_response_to_axum_response(handler_response: crate::wasm::HandlerRespo
     let body = inject_head_tags(handler_response.body, handler_response.head_links);
 
     builder.body(Body::from(body)).expect("response builder")
+}
+
+/// AUTH-S008: `timeoutMinutes` is an inactivity timeout. The session store
+/// already measures it from the session's last use; this re-sends the
+/// session cookie (fresh Max-Age) on every response to a request that used
+/// the session, so the browser does not drop it while the user is active.
+/// Responses that set or clear the session cookie themselves, and sessions
+/// the handler ended, are left alone.
+fn keep_session_cookie_alive(
+    response: &mut crate::wasm::HandlerResponse,
+    session_id: &str,
+    wasm: &WasmInstance,
+) {
+    let store = wasm.session_store().read().expect("store lock poisoned");
+    if !store.exists_raw(session_id) {
+        return;
+    }
+    let sets_session_cookie = response
+        .set_cookie
+        .as_deref()
+        .is_some_and(|c| store.is_session_cookie(c))
+        || response
+            .headers
+            .iter()
+            .any(|(k, v)| k.eq_ignore_ascii_case("set-cookie") && store.is_session_cookie(v));
+    if !sets_session_cookie {
+        response
+            .headers
+            .push(("Set-Cookie".to_string(), store.format_cookie(session_id)));
+    }
 }
 
 /// Resolve the caller's identity for a request.
@@ -1499,6 +1537,11 @@ mod tests {
     /// generated `__auth_build_cookie_header` and `jwt_verify` helpers.
     /// `jwt_verify` accepts exactly the token `abc.def.g`.
     fn auth_module() -> Vec<u8> {
+        auth_module_with("")
+    }
+
+    /// [`auth_module`] with extra exported functions (WAT text).
+    fn auth_module_with(extra: &str) -> Vec<u8> {
         let cookie = "app.sid=probe; Path=/; SameSite=Lax; HttpOnly; Max-Age=300";
         let claims = r#"{"sub":7,"role":"user"}"#;
         let token = "abc.def.g";
@@ -1531,6 +1574,7 @@ mod tests {
         (local.set $i (i32.add (local.get $i) (i32.const 1)))
         (br $next)))
     (i32.const 2048))
+  {extra}
 )"#,
             cookie = lp_data(cookie),
             claims = lp_data(claims),
@@ -1592,6 +1636,79 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// A frame.auth application (plus the `extra` exports) with a session
+    /// `s1`.
+    fn session_app(extra: &str) -> WasmInstance {
+        let wasm = WasmInstance::from_bytes(
+            &auth_module_with(extra),
+            crate::router::create_shared_router(),
+        )
+        .expect("load module");
+        wasm.initialize().expect("initialize");
+        wasm.session_store()
+            .write()
+            .unwrap()
+            .store_raw("s1", r#"{"userId":5,"claims":{"role":"user"}}"#);
+        wasm
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_session_cookie_is_renewed() {
+        let wasm = session_app("");
+        let response = |set_cookie: Option<&str>, headers: Vec<(String, String)>| {
+            crate::wasm::HandlerResponse {
+                body: String::new(),
+                set_cookie: set_cookie.map(str::to_string),
+                headers,
+                redirect: None,
+                status: None,
+                head_links: Vec::new(),
+            }
+        };
+
+        // A request that used the session gets its cookie back with a fresh
+        // Max-Age (AUTH-S008: the timeout runs from the last activity).
+        let mut plain = response(None, Vec::new());
+        keep_session_cookie_alive(&mut plain, "s1", &wasm);
+        let renewed: Vec<&String> = plain
+            .headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("set-cookie"))
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(renewed.len(), 1);
+        assert!(renewed[0].starts_with("app.sid=s1;"), "{}", renewed[0]);
+        assert!(renewed[0].contains("Max-Age=300"), "{}", renewed[0]);
+
+        // Other cookies do not count as the session cookie.
+        let mut refresh = response(
+            None,
+            vec![(
+                "Set-Cookie".to_string(),
+                "frame.refresh=t; Path=/".to_string(),
+            )],
+        );
+        keep_session_cookie_alive(&mut refresh, "s1", &wasm);
+        assert_eq!(refresh.headers.len(), 2);
+
+        // A response that sets or clears the session cookie keeps its own.
+        let mut login = response(Some("app.sid=new; Path=/"), Vec::new());
+        keep_session_cookie_alive(&mut login, "s1", &wasm);
+        assert!(login.headers.is_empty());
+        let mut logout = response(
+            None,
+            vec![("Set-Cookie".to_string(), "app.sid=; Max-Age=0".to_string())],
+        );
+        keep_session_cookie_alive(&mut logout, "s1", &wasm);
+        assert_eq!(logout.headers.len(), 1);
+
+        // A session the handler ended is not renewed.
+        wasm.session_store().write().unwrap().delete_raw("s1");
+        let mut ended = response(None, Vec::new());
+        keep_session_cookie_alive(&mut ended, "s1", &wasm);
+        assert!(ended.headers.is_empty());
     }
 
     #[test]
