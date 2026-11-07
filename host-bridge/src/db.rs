@@ -2735,7 +2735,7 @@ mod tests {
             .execute(json!({
                 "sql": "WITH n AS (SELECT 'from cte' AS v) INSERT INTO users (name, email) SELECT v, 'cte@example.test' FROM n",
                 "params": []
-            }))
+            }), None)
             .await
             .unwrap();
         assert_eq!(result["ok"], true, "{result}");
