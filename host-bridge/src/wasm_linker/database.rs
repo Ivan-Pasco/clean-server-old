@@ -16,9 +16,9 @@
 //! All functions are generic over `WasmStateCore` to work with any runtime.
 
 use super::helpers::{read_raw_string, write_string_to_caller};
-use super::state::WasmStateCore;
+use super::state::{SharedDbBridge, WasmStateCore};
 use crate::error::BridgeResult;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::cell::RefCell;
 use tracing::{debug, error};
 use wasmtime::{Caller, Linker};
@@ -99,6 +99,31 @@ fn last_insert_id_response(alias: &str, id: Option<i64>) -> String {
 
 /// Detect whether `sql` is an INSERT (so the bridge knows to cache the
 /// resulting `last_insert_id` after dispatching to `execute`).
+/// Run a `DbBridge` statement function (`query`, `execute`, `paginate`,
+/// `cursor_page`) for a bridge call: inside the transaction the caller's
+/// `_db_begin` opened when there is one, on a pooled connection otherwise.
+fn run_statement<S: WasmStateCore>(
+    caller: &mut Caller<'_, S>,
+    db_bridge: SharedDbBridge,
+    function: &str,
+    params: Value,
+) -> anyhow::Result<Value> {
+    let mut tx = caller
+        .data_mut()
+        .transaction_slot()
+        .and_then(|slot| slot.take());
+    let result = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            let mut bridge = db_bridge.write().await;
+            bridge.call_in(function, params, tx.as_mut()).await
+        })
+    });
+    if let (Some(tx), Some(slot)) = (tx, caller.data_mut().transaction_slot()) {
+        *slot = Some(tx);
+    }
+    result
+}
+
 fn is_insert(sql: &str) -> bool {
     sql.trim_start().to_uppercase().starts_with("INSERT")
         || sql.trim_start().to_uppercase().starts_with("REPLACE")
@@ -182,20 +207,15 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
                 "query"
             };
 
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    let mut bridge = db_bridge.write().await;
-                    bridge
-                        .call(
-                            method,
-                            json!({
-                                "sql": sql,
-                                "params": params
-                            }),
-                        )
-                        .await
-                })
-            });
+            let result = run_statement(
+                &mut caller,
+                db_bridge,
+                method,
+                json!({
+                    "sql": sql,
+                    "params": params
+                }),
+            );
 
             // Cache last_insert_id from successful INSERT/REPLACE so a follow-up
             // `SELECT LAST_INSERT_ID()` can be served from state.
@@ -293,20 +313,15 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
                 }
             };
 
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    let mut bridge = db_bridge.write().await;
-                    bridge
-                        .call(
-                            "execute",
-                            json!({
-                                "sql": sql,
-                                "params": params
-                            }),
-                        )
-                        .await
-                })
-            });
+            let result = run_statement(
+                &mut caller,
+                db_bridge,
+                "execute",
+                json!({
+                    "sql": sql,
+                    "params": params
+                }),
+            );
 
             match result {
                 Ok(v) => {
@@ -347,6 +362,9 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
     // TRANSACTIONS
     // =========================================
 
+    // A transaction holds its own pooled connection from `_db_begin` until
+    // `_db_commit` / `_db_rollback`; the statements run in between join it
+    // (see `run_statement`). One transaction is open at a time per caller.
     linker.func_wrap("env", "_db_begin", |mut caller: Caller<'_, S>| -> i32 {
         let db_bridge = match caller.data().db_bridge() {
             Some(db) => db,
@@ -355,27 +373,30 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
                 return 0;
             }
         };
+        match caller.data_mut().transaction_slot() {
+            None => {
+                error!("_db_begin: this runtime does not support transactions");
+                return 0;
+            }
+            Some(Some(_)) => {
+                error!("_db_begin: a transaction is already open");
+                return 0;
+            }
+            Some(None) => {}
+        }
 
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let mut bridge = db_bridge.write().await;
-                bridge.call("transaction_begin", json!({})).await
-            })
+        let opened = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { db_bridge.read().await.begin_transaction().await })
         });
 
-        match result {
-            Ok(v) => {
-                if let Some(tx_id) = v
-                    .get("data")
-                    .and_then(|d| d.get("tx_id"))
-                    .and_then(|t| t.as_str())
-                {
-                    debug!("_db_begin: Transaction started: {}", tx_id);
-                    caller.data_mut().set_current_tx_id(Some(tx_id.to_string()));
-                    1
-                } else {
-                    0
+        match opened {
+            Ok(tx) => {
+                if let Some(slot) = caller.data_mut().transaction_slot() {
+                    *slot = Some(tx);
                 }
+                debug!("_db_begin: Transaction started");
+                1
             }
             Err(e) => {
                 error!("_db_begin: Transaction begin error: {}", e);
@@ -385,78 +406,39 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
     })?;
 
     linker.func_wrap("env", "_db_commit", |mut caller: Caller<'_, S>| -> i32 {
-        let tx_id = match caller.data().current_tx_id() {
-            Some(id) => id.to_string(),
+        let tx = match caller.data_mut().transaction_slot().and_then(|s| s.take()) {
+            Some(tx) => tx,
             None => {
                 error!("_db_commit: No active transaction");
                 return 0;
             }
         };
-
-        let db_bridge = match caller.data().db_bridge() {
-            Some(db) => db,
-            None => return 0,
-        };
-
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let mut bridge = db_bridge.write().await;
-                bridge
-                    .call("transaction_commit", json!({ "tx_id": tx_id }))
-                    .await
-            })
-        });
-
+        let result =
+            tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(tx.commit()));
         match result {
-            Ok(v) => {
-                caller.data_mut().set_current_tx_id(None);
-                if v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) {
-                    1
-                } else {
-                    0
-                }
-            }
-            Err(_) => {
-                caller.data_mut().set_current_tx_id(None);
+            Ok(()) => 1,
+            Err(e) => {
+                error!("_db_commit: {}", e);
                 0
             }
         }
     })?;
 
     linker.func_wrap("env", "_db_rollback", |mut caller: Caller<'_, S>| -> i32 {
-        let tx_id = match caller.data().current_tx_id() {
-            Some(id) => id.to_string(),
+        let tx = match caller.data_mut().transaction_slot().and_then(|s| s.take()) {
+            Some(tx) => tx,
             None => {
                 error!("_db_rollback: No active transaction");
                 return 0;
             }
         };
-
-        let db_bridge = match caller.data().db_bridge() {
-            Some(db) => db,
-            None => return 0,
-        };
-
         let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let mut bridge = db_bridge.write().await;
-                bridge
-                    .call("transaction_rollback", json!({ "tx_id": tx_id }))
-                    .await
-            })
+            tokio::runtime::Handle::current().block_on(tx.rollback())
         });
-
         match result {
-            Ok(v) => {
-                caller.data_mut().set_current_tx_id(None);
-                if v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) {
-                    1
-                } else {
-                    0
-                }
-            }
-            Err(_) => {
-                caller.data_mut().set_current_tx_id(None);
+            Ok(()) => 1,
+            Err(e) => {
+                error!("_db_rollback: {}", e);
                 0
             }
         }
@@ -640,22 +622,17 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
             let where_val: serde_json::Value =
                 serde_json::from_str(&where_json).unwrap_or(serde_json::json!({}));
 
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    let mut bridge = db_bridge.write().await;
-                    bridge
-                        .call(
-                            "paginate",
-                            serde_json::json!({
-                                "table": table,
-                                "where": where_val,
-                                "page": page,
-                                "per_page": per_page
-                            }),
-                        )
-                        .await
-                })
-            });
+            let result = run_statement(
+                &mut caller,
+                db_bridge,
+                "paginate",
+                serde_json::json!({
+                    "table": table,
+                    "where": where_val,
+                    "page": page,
+                    "per_page": per_page
+                }),
+            );
 
             let result_str = match result {
                 Ok(v) => v.to_string(),
@@ -741,23 +718,18 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
             let where_val: serde_json::Value =
                 serde_json::from_str(&where_json).unwrap_or(serde_json::json!({}));
 
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    let mut bridge = db_bridge.write().await;
-                    bridge
-                        .call(
-                            "cursor_page",
-                            serde_json::json!({
-                                "table": table,
-                                "where": where_val,
-                                "per_page": per_page,
-                                "after": after,
-                                "by_field": by_field
-                            }),
-                        )
-                        .await
-                })
-            });
+            let result = run_statement(
+                &mut caller,
+                db_bridge,
+                "cursor_page",
+                serde_json::json!({
+                    "table": table,
+                    "where": where_val,
+                    "per_page": per_page,
+                    "after": after,
+                    "by_field": by_field
+                }),
+            );
 
             let result_str = match result {
                 Ok(v) => v.to_string(),
@@ -1126,12 +1098,12 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
                 || sql_upper.starts_with("DROP") || sql_upper.starts_with("ALTER")
                 || sql_upper.starts_with("TRUNCATE") || sql_upper.starts_with("REPLACE")
             { "execute" } else { "query" };
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    let mut bridge = db_bridge.write().await;
-                    bridge.call(method, json!({"sql": sql, "params": params})).await
-                })
-            });
+            let result = run_statement(
+                &mut caller,
+                db_bridge,
+                method,
+                json!({"sql": sql, "params": params}),
+            );
             let s = match result {
                 Ok(v) => v.to_string(),
                 Err(e) => json!({"ok":false,"err":{"code":"DB_ERROR","message":e.to_string()}}).to_string(),
@@ -1169,14 +1141,12 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
             };
             let params: Vec<serde_json::Value> =
                 serde_json::from_str(&params_json).unwrap_or_default();
-            let result = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    let mut bridge = db_bridge.write().await;
-                    bridge
-                        .call("execute", json!({"sql": sql, "params": params}))
-                        .await
-                })
-            });
+            let result = run_statement(
+                &mut caller,
+                db_bridge,
+                "execute",
+                json!({"sql": sql, "params": params}),
+            );
             let affected: i32 = match result {
                 Ok(v) => v
                     .get("data")

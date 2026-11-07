@@ -251,8 +251,8 @@ pub struct WasmState {
     pub pending_status: Option<u16>,
     /// Pending response body (for _http_respond)
     pub pending_body: Option<String>,
-    /// Current transaction ID (for implicit commit/rollback)
-    pub current_tx_id: Option<String>,
+    /// Transaction opened by `_db_begin` (see `WasmStateCore::transaction_slot`)
+    pub open_transaction: Option<host_bridge::OpenTransaction>,
     /// Cached last_insert_id from the most recent INSERT in this request.
     /// The DB driver acquires a fresh pooled connection per query, so
     /// MySQL's `LAST_INSERT_ID()` and SQLite's `LAST_INSERT_ROWID()` are
@@ -475,7 +475,7 @@ impl WasmState {
             pending_redirect: None,
             pending_status: None,
             pending_body: None,
-            current_tx_id: None,
+            open_transaction: None,
             last_insert_id: None,
             roles_store: Arc::new(RwLock::new(RolesStore::new())),
             static_dirs: create_shared_static_dirs(),
@@ -515,7 +515,7 @@ impl WasmState {
             pending_redirect: None,
             pending_status: None,
             pending_body: None,
-            current_tx_id: None,
+            open_transaction: None,
             last_insert_id: None,
             roles_store: Arc::new(RwLock::new(RolesStore::new())),
             static_dirs: create_shared_static_dirs(),
@@ -565,7 +565,7 @@ impl WasmState {
             pending_redirect: None,
             pending_status: None,
             pending_body: None,
-            current_tx_id: None,
+            open_transaction: None,
             last_insert_id: None,
             roles_store: Arc::new(RwLock::new(RolesStore::new())),
             static_dirs,
@@ -689,12 +689,8 @@ impl WasmStateCore for WasmState {
         self.last_error.as_deref()
     }
 
-    fn current_tx_id(&self) -> Option<&str> {
-        self.current_tx_id.as_deref()
-    }
-
-    fn set_current_tx_id(&mut self, tx_id: Option<String>) {
-        self.current_tx_id = tx_id;
+    fn transaction_slot(&mut self) -> Option<&mut Option<host_bridge::OpenTransaction>> {
+        Some(&mut self.open_transaction)
     }
 
     fn last_insert_id(&self) -> Option<i64> {

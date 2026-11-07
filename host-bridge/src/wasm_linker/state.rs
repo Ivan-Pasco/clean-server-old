@@ -3,7 +3,7 @@
 //! Defines the state held by each WASM store instance and the core trait
 //! that allows host functions to work with any compatible state type.
 
-use crate::DbBridge;
+use crate::{DbBridge, OpenTransaction};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock as TokioRwLock;
@@ -55,14 +55,13 @@ pub trait WasmStateCore: Send + 'static {
         None
     }
 
-    /// Get the current transaction ID (for _db_commit/_db_rollback)
-    fn current_tx_id(&self) -> Option<&str> {
+    /// The slot holding the database transaction opened by `_db_begin`.
+    /// `_db_query` / `_db_execute` / `_db_paginate` / `_db_cursor_page` run
+    /// inside it while it is open, `_db_commit` / `_db_rollback` close it,
+    /// and dropping the state rolls an unfinished one back. `None` (the
+    /// default) means the runtime does not support transactions.
+    fn transaction_slot(&mut self) -> Option<&mut Option<OpenTransaction>> {
         None
-    }
-
-    /// Set the current transaction ID (called by _db_begin)
-    fn set_current_tx_id(&mut self, _tx_id: Option<String>) {
-        // Default implementation does nothing
     }
 
     /// Get the last_insert_id cached from the most recent INSERT in this
@@ -350,8 +349,8 @@ pub struct WasmState {
     pub db_bridge: SharedDbBridge,
     /// Router reference (set by server)
     pub router: Option<Arc<dyn RouterInterface + Send + Sync>>,
-    /// Current transaction ID (for implicit commit/rollback)
-    pub current_tx_id: Option<String>,
+    /// Transaction opened by `_db_begin` (see `WasmStateCore::transaction_slot`)
+    pub open_transaction: Option<OpenTransaction>,
     /// Cached last_insert_id from the most recent INSERT in this state.
     /// See `WasmStateCore::last_insert_id` for the rationale.
     pub last_insert_id: Option<i64>,
@@ -383,7 +382,7 @@ impl WasmState {
             last_error: None,
             db_bridge: Arc::new(TokioRwLock::new(DbBridge::new())),
             router: None,
-            current_tx_id: None,
+            open_transaction: None,
             last_insert_id: None,
         }
     }
@@ -399,7 +398,7 @@ impl WasmState {
             last_error: None,
             db_bridge,
             router: None,
-            current_tx_id: None,
+            open_transaction: None,
             last_insert_id: None,
         }
     }
@@ -483,12 +482,8 @@ impl WasmStateCore for WasmState {
         Some(&mut self.http_response)
     }
 
-    fn current_tx_id(&self) -> Option<&str> {
-        self.current_tx_id.as_deref()
-    }
-
-    fn set_current_tx_id(&mut self, tx_id: Option<String>) {
-        self.current_tx_id = tx_id;
+    fn transaction_slot(&mut self) -> Option<&mut Option<OpenTransaction>> {
+        Some(&mut self.open_transaction)
     }
 
     fn last_insert_id(&self) -> Option<i64> {

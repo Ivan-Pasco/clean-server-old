@@ -100,6 +100,17 @@ impl DatabaseDriver {
         }
     }
 
+    /// Open a transaction on a connection taken from the pool. Every
+    /// statement run through the returned handle joins the transaction;
+    /// dropping the handle without [`OpenTransaction::commit`] rolls it back.
+    pub async fn begin(&self) -> Result<OpenTransaction> {
+        Ok(match self {
+            Self::Postgres(pool) => OpenTransaction::Postgres(pool.begin().await?),
+            Self::MySql(pool) => OpenTransaction::MySql(pool.begin().await?),
+            Self::Sqlite(pool) => OpenTransaction::Sqlite(pool.begin().await?),
+        })
+    }
+
     /// Begin a real database transaction and execute operations
     pub async fn execute_transaction(&self, operations: &[(String, Vec<Value>)]) -> Result<()> {
         match self {
@@ -150,18 +161,21 @@ impl DatabaseDriver {
     // PostgreSQL Implementation
     // ========================================================================
 
-    async fn query_postgres(
-        pool: &PgPool,
+    async fn query_postgres<'c, E>(
+        executor: E,
         sql: &str,
         params: &[Value],
-    ) -> Result<Vec<serde_json::Map<String, Value>>> {
+    ) -> Result<Vec<serde_json::Map<String, Value>>>
+    where
+        E: sqlx::Executor<'c, Database = sqlx::Postgres>,
+    {
         let mut query = sqlx::query(sql);
 
         for param in params {
             query = Self::bind_param_postgres(query, param);
         }
 
-        let rows = query.fetch_all(pool).await?;
+        let rows = query.fetch_all(executor).await?;
 
         let mut result = Vec::new();
         for row in rows {
@@ -281,14 +295,21 @@ impl DatabaseDriver {
         Ok(map)
     }
 
-    async fn execute_postgres(pool: &PgPool, sql: &str, params: &[Value]) -> Result<ExecuteResult> {
+    async fn execute_postgres<'c, E>(
+        executor: E,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecuteResult>
+    where
+        E: sqlx::Executor<'c, Database = sqlx::Postgres>,
+    {
         let mut query = sqlx::query(sql);
 
         for param in params {
             query = Self::bind_param_postgres(query, param);
         }
 
-        let result = query.execute(pool).await?;
+        let result = query.execute(executor).await?;
 
         Ok(ExecuteResult {
             rows_affected: result.rows_affected(),
@@ -318,18 +339,21 @@ impl DatabaseDriver {
     // MySQL Implementation
     // ========================================================================
 
-    async fn query_mysql(
-        pool: &MySqlPool,
+    async fn query_mysql<'c, E>(
+        executor: E,
         sql: &str,
         params: &[Value],
-    ) -> Result<Vec<serde_json::Map<String, Value>>> {
+    ) -> Result<Vec<serde_json::Map<String, Value>>>
+    where
+        E: sqlx::Executor<'c, Database = sqlx::MySql>,
+    {
         let mut query = sqlx::query(sql);
 
         for param in params {
             query = Self::bind_param_mysql(query, param);
         }
 
-        let rows = query.fetch_all(pool).await?;
+        let rows = query.fetch_all(executor).await?;
 
         let mut result = Vec::new();
         for row in rows {
@@ -452,14 +476,17 @@ impl DatabaseDriver {
         Ok(map)
     }
 
-    async fn execute_mysql(pool: &MySqlPool, sql: &str, params: &[Value]) -> Result<ExecuteResult> {
+    async fn execute_mysql<'c, E>(executor: E, sql: &str, params: &[Value]) -> Result<ExecuteResult>
+    where
+        E: sqlx::Executor<'c, Database = sqlx::MySql>,
+    {
         let mut query = sqlx::query(sql);
 
         for param in params {
             query = Self::bind_param_mysql(query, param);
         }
 
-        let result = query.execute(pool).await?;
+        let result = query.execute(executor).await?;
 
         Ok(ExecuteResult {
             rows_affected: result.rows_affected(),
@@ -489,18 +516,21 @@ impl DatabaseDriver {
     // SQLite Implementation
     // ========================================================================
 
-    async fn query_sqlite(
-        pool: &SqlitePool,
+    async fn query_sqlite<'c, E>(
+        executor: E,
         sql: &str,
         params: &[Value],
-    ) -> Result<Vec<serde_json::Map<String, Value>>> {
+    ) -> Result<Vec<serde_json::Map<String, Value>>>
+    where
+        E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+    {
         let mut query = sqlx::query(sql);
 
         for param in params {
             query = Self::bind_param_sqlite(query, param);
         }
 
-        let rows = query.fetch_all(pool).await?;
+        let rows = query.fetch_all(executor).await?;
 
         let mut result = Vec::new();
         for row in rows {
@@ -568,18 +598,21 @@ impl DatabaseDriver {
         Ok(map)
     }
 
-    async fn execute_sqlite(
-        pool: &SqlitePool,
+    async fn execute_sqlite<'c, E>(
+        executor: E,
         sql: &str,
         params: &[Value],
-    ) -> Result<ExecuteResult> {
+    ) -> Result<ExecuteResult>
+    where
+        E: sqlx::Executor<'c, Database = sqlx::Sqlite>,
+    {
         let mut query = sqlx::query(sql);
 
         for param in params {
             query = Self::bind_param_sqlite(query, param);
         }
 
-        let result = query.execute(pool).await?;
+        let result = query.execute(executor).await?;
 
         Ok(ExecuteResult {
             rows_affected: result.rows_affected(),
@@ -603,6 +636,113 @@ impl DatabaseDriver {
 
         tx.commit().await?;
         Ok(())
+    }
+}
+
+// ============================================================================
+// OPEN TRANSACTIONS
+// ============================================================================
+
+/// A database transaction opened by `_db_begin`, holding its own pooled
+/// connection until it is committed or rolled back. Queries issued while it
+/// is open run on that connection, so they see the transaction's writes and
+/// `rollback` undoes them. Dropping it without committing rolls it back.
+pub enum OpenTransaction {
+    Postgres(sqlx::Transaction<'static, sqlx::Postgres>),
+    MySql(sqlx::Transaction<'static, sqlx::MySql>),
+    Sqlite(sqlx::Transaction<'static, sqlx::Sqlite>),
+}
+
+impl OpenTransaction {
+    /// Run a SELECT inside the transaction.
+    pub async fn query(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<serde_json::Map<String, Value>>> {
+        match self {
+            Self::Postgres(tx) => DatabaseDriver::query_postgres(&mut **tx, sql, params).await,
+            Self::MySql(tx) => DatabaseDriver::query_mysql(&mut **tx, sql, params).await,
+            Self::Sqlite(tx) => DatabaseDriver::query_sqlite(&mut **tx, sql, params).await,
+        }
+    }
+
+    /// Run an INSERT/UPDATE/DELETE (or DDL) inside the transaction.
+    pub async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<ExecuteResult> {
+        match self {
+            Self::Postgres(tx) => DatabaseDriver::execute_postgres(&mut **tx, sql, params).await,
+            Self::MySql(tx) => DatabaseDriver::execute_mysql(&mut **tx, sql, params).await,
+            Self::Sqlite(tx) => DatabaseDriver::execute_sqlite(&mut **tx, sql, params).await,
+        }
+    }
+
+    /// Make the transaction's writes permanent.
+    pub async fn commit(self) -> Result<()> {
+        match self {
+            Self::Postgres(tx) => tx.commit().await?,
+            Self::MySql(tx) => tx.commit().await?,
+            Self::Sqlite(tx) => tx.commit().await?,
+        }
+        Ok(())
+    }
+
+    /// Undo the transaction's writes.
+    pub async fn rollback(self) -> Result<()> {
+        match self {
+            Self::Postgres(tx) => tx.rollback().await?,
+            Self::MySql(tx) => tx.rollback().await?,
+            Self::Sqlite(tx) => tx.rollback().await?,
+        }
+        Ok(())
+    }
+
+    /// See [`DatabaseDriver::host_sql`].
+    fn host_sql(&self, sql: &str) -> String {
+        match self {
+            Self::Postgres(_) => number_placeholders(sql),
+            Self::MySql(_) | Self::Sqlite(_) => sql.to_string(),
+        }
+    }
+}
+
+/// Where a bridge statement runs: on a pooled connection, or inside the
+/// caller's open transaction.
+enum QueryTarget<'a> {
+    Pool(DatabaseDriver),
+    Tx(&'a mut OpenTransaction),
+}
+
+impl<'a> QueryTarget<'a> {
+    fn new(driver: &DatabaseDriver, tx: Option<&'a mut OpenTransaction>) -> QueryTarget<'a> {
+        match tx {
+            Some(tx) => QueryTarget::Tx(tx),
+            None => QueryTarget::Pool(driver.clone()),
+        }
+    }
+
+    async fn query(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<serde_json::Map<String, Value>>> {
+        match self {
+            Self::Pool(driver) => driver.query(sql, params).await,
+            Self::Tx(tx) => tx.query(sql, params).await,
+        }
+    }
+
+    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<ExecuteResult> {
+        match self {
+            Self::Pool(driver) => driver.execute(sql, params).await,
+            Self::Tx(tx) => tx.execute(sql, params).await,
+        }
+    }
+
+    fn host_sql(&self, sql: &str) -> String {
+        match self {
+            Self::Pool(driver) => driver.host_sql(sql),
+            Self::Tx(tx) => tx.host_sql(sql),
+        }
     }
 }
 
@@ -802,9 +942,27 @@ impl DbBridge {
 
     /// Main call dispatcher for the DB bridge
     pub async fn call(&mut self, function: &str, params: Value) -> Result<Value> {
+        self.call_in(function, params, None).await
+    }
+
+    /// Open a transaction for `_db_begin`. The caller keeps the handle for
+    /// the rest of its request and passes it to [`DbBridge::call_in`] so the
+    /// statements it runs join the transaction.
+    pub async fn begin_transaction(&self) -> Result<OpenTransaction> {
+        self.get_driver().await?.begin().await
+    }
+
+    /// [`DbBridge::call`], with the statement functions (`query`, `execute`,
+    /// `paginate`, `cursor_page`) running inside `tx` when it is given.
+    pub async fn call_in(
+        &mut self,
+        function: &str,
+        params: Value,
+        tx: Option<&mut OpenTransaction>,
+    ) -> Result<Value> {
         match function {
-            "query" => self.query(params).await,
-            "execute" => self.execute(params).await,
+            "query" => self.query(params, tx).await,
+            "execute" => self.execute(params, tx).await,
             "transaction_begin" => self.transaction_begin(params).await,
             "transaction_commit" => self.transaction_commit(params).await,
             "transaction_rollback" => self.transaction_rollback(params).await,
@@ -813,8 +971,8 @@ impl DbBridge {
             "config" => self.config_call(params).await,
             "configure" => self.config_call(params).await,
             "register_migration" => self.register_migration(params).await,
-            "paginate" => self.paginate(params).await,
-            "cursor_page" => self.cursor_page(params).await,
+            "paginate" => self.paginate(params, tx).await,
+            "cursor_page" => self.cursor_page(params, tx).await,
             "migration_diff" => self.migration_diff(params).await,
             "migration_status" => self.migration_status().await,
             "rollback_migration" => self.rollback_migration(params).await,
@@ -953,7 +1111,7 @@ impl DbBridge {
     }
 
     /// Execute a SELECT query and return rows
-    async fn query(&self, params: Value) -> Result<Value> {
+    async fn query(&self, params: Value, tx: Option<&mut OpenTransaction>) -> Result<Value> {
         let req: DbQueryRequest = match serde_json::from_value(params) {
             Ok(req) => req,
             Err(e) => {
@@ -1003,9 +1161,10 @@ impl DbBridge {
                 .unwrap_or(30000)
         };
 
+        let mut target = QueryTarget::new(&driver, tx);
         let result = tokio::time::timeout(
             Duration::from_millis(timeout),
-            driver.query(&req.sql, &req.params),
+            target.query(&req.sql, &req.params),
         )
         .await;
 
@@ -1040,7 +1199,7 @@ impl DbBridge {
     }
 
     /// Execute an INSERT/UPDATE/DELETE query
-    async fn execute(&self, params: Value) -> Result<Value> {
+    async fn execute(&self, params: Value, tx: Option<&mut OpenTransaction>) -> Result<Value> {
         let req: DbExecuteRequest = match serde_json::from_value(params) {
             Ok(req) => req,
             Err(e) => {
@@ -1091,9 +1250,10 @@ impl DbBridge {
                 .unwrap_or(30000)
         };
 
+        let mut target = QueryTarget::new(&driver, tx);
         let result = tokio::time::timeout(
             Duration::from_millis(timeout),
-            driver.execute(&req.sql, &req.params),
+            target.execute(&req.sql, &req.params),
         )
         .await;
 
@@ -1558,7 +1718,7 @@ impl DbBridge {
     /// - `per_page` (integer, default 20)
     ///
     /// Returns PagedResult JSON envelope.
-    async fn paginate(&self, params: Value) -> Result<Value> {
+    async fn paginate(&self, params: Value, tx: Option<&mut OpenTransaction>) -> Result<Value> {
         let table = match params.get("table").and_then(|v| v.as_str()) {
             Some(t) => t.to_string(),
             None => {
@@ -1622,10 +1782,11 @@ impl DbBridge {
             )
         };
 
-        let count_sql = driver.host_sql(&count_sql);
+        let mut target = QueryTarget::new(&driver, tx);
+        let count_sql = target.host_sql(&count_sql);
         let count_result = tokio::time::timeout(
             Duration::from_millis(timeout),
-            driver.query(&count_sql, &bind_params),
+            target.query(&count_sql, &bind_params),
         )
         .await;
 
@@ -1665,14 +1826,14 @@ impl DbBridge {
         let order_sql = order_by
             .map(|o| format!(" ORDER BY {}", o))
             .unwrap_or_default();
-        let data_sql = driver.host_sql(&format!(
+        let data_sql = target.host_sql(&format!(
             "SELECT * FROM {}{}{} LIMIT {} OFFSET {}",
             table, where_sql, order_sql, per_page, offset
         ));
 
         let data_result = tokio::time::timeout(
             Duration::from_millis(timeout),
-            driver.query(&data_sql, &bind_params),
+            target.query(&data_sql, &bind_params),
         )
         .await;
 
@@ -1711,7 +1872,7 @@ impl DbBridge {
     /// - `by_field` (string, default "id")
     ///
     /// Returns CursorResult JSON envelope.
-    async fn cursor_page(&self, params: Value) -> Result<Value> {
+    async fn cursor_page(&self, params: Value, tx: Option<&mut OpenTransaction>) -> Result<Value> {
         let table = match params.get("table").and_then(|v| v.as_str()) {
             Some(t) => t.to_string(),
             None => {
@@ -1798,10 +1959,11 @@ impl DbBridge {
             )
         };
 
-        let sql = driver.host_sql(&sql);
+        let mut target = QueryTarget::new(&driver, tx);
+        let sql = target.host_sql(&sql);
         let result = tokio::time::timeout(
             Duration::from_millis(timeout),
-            driver.query(&sql, &bind_params),
+            target.query(&sql, &bind_params),
         )
         .await;
 
