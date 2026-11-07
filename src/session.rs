@@ -66,6 +66,8 @@ pub struct SessionConfig {
     pub cookie_name: String,
     /// Cookie path
     pub cookie_path: String,
+    /// Cookie Domain attribute; `None` keeps the cookie on the exact host
+    pub domain: Option<String>,
     /// Cookie SameSite attribute
     pub same_site: String,
     /// Cookie secure flag
@@ -80,6 +82,7 @@ impl Default for SessionConfig {
             timeout_seconds: 3600,
             cookie_name: "session".to_string(),
             cookie_path: "/".to_string(),
+            domain: None,
             same_site: "Lax".to_string(),
             secure: true,
             http_only: true,
@@ -117,6 +120,7 @@ impl SessionConfig {
             };
             match key.to_ascii_lowercase().as_str() {
                 "path" if !value.is_empty() => config.cookie_path = value.to_string(),
+                "domain" if !value.is_empty() => config.domain = Some(value.to_string()),
                 "samesite" if !value.is_empty() => config.same_site = value.to_string(),
                 "secure" => config.secure = true,
                 "httponly" => config.http_only = true,
@@ -329,31 +333,42 @@ impl SessionStore {
 
     /// Format a Set-Cookie header for the session
     pub fn format_cookie(&self, session_id: &str) -> String {
-        let mut cookie = format!(
-            "{}={}; Path={}",
-            self.config.cookie_name, session_id, self.config.cookie_path
-        );
-
-        if self.config.http_only {
-            cookie.push_str("; HttpOnly");
-        }
-        if self.config.secure {
-            cookie.push_str("; Secure");
-        }
-        cookie.push_str(&format!("; SameSite={}", self.config.same_site));
-
-        // Add max-age
-        cookie.push_str(&format!("; Max-Age={}", self.config.timeout_seconds));
-
-        cookie
+        format!(
+            "{}={}{}; Max-Age={}",
+            self.config.cookie_name,
+            session_id,
+            self.cookie_attributes(),
+            self.config.timeout_seconds
+        )
     }
 
-    /// Format a cookie header that clears the session
+    /// Format a cookie header that clears the session. It carries the same
+    /// Path / Domain attributes as the session cookie, or the browser would
+    /// keep the original.
     pub fn format_clear_cookie(&self) -> String {
         format!(
-            "{}=; Path={}; Max-Age=0; HttpOnly",
-            self.config.cookie_name, self.config.cookie_path
+            "{}={}; Max-Age=0",
+            self.config.cookie_name,
+            self.cookie_attributes()
         )
+    }
+
+    /// `; Path=..; SameSite=..[; Domain=..][; Secure][; HttpOnly]`
+    fn cookie_attributes(&self) -> String {
+        let mut attrs = format!(
+            "; Path={}; SameSite={}",
+            self.config.cookie_path, self.config.same_site
+        );
+        if let Some(domain) = &self.config.domain {
+            attrs.push_str(&format!("; Domain={}", domain));
+        }
+        if self.config.secure {
+            attrs.push_str("; Secure");
+        }
+        if self.config.http_only {
+            attrs.push_str("; HttpOnly");
+        }
+        attrs
     }
 
     // =========================================
@@ -793,6 +808,7 @@ mod tests {
         let config = SessionConfig {
             cookie_name: "mysession".to_string(),
             cookie_path: "/app".to_string(),
+            domain: None,
             same_site: "Strict".to_string(),
             secure: true,
             http_only: true,
@@ -807,5 +823,28 @@ mod tests {
         assert!(cookie.contains("Secure"));
         assert!(cookie.contains("SameSite=Strict"));
         assert!(cookie.contains("Max-Age=3600"));
+    }
+
+    #[test]
+    fn test_domain_is_kept_on_session_and_clearing_cookies() {
+        let cfg = SessionConfig::from_set_cookie(
+            "app.sid=probe; Path=/; SameSite=Lax; Domain=example.com; Secure; HttpOnly; Max-Age=300",
+        )
+        .expect("config");
+        assert_eq!(cfg.domain.as_deref(), Some("example.com"));
+        let store = SessionStore::new(cfg);
+        let cookie = store.format_cookie("s1");
+        assert!(cookie.starts_with("app.sid=s1;"), "{cookie}");
+        assert!(cookie.contains("; Domain=example.com"), "{cookie}");
+        // The clearing cookie must name the same Domain and Path, or the
+        // browser keeps the session cookie.
+        let clear = store.format_clear_cookie();
+        assert!(clear.starts_with("app.sid=;"), "{clear}");
+        assert!(clear.contains("; Domain=example.com"), "{clear}");
+        assert!(clear.contains("; Path=/"), "{clear}");
+        assert!(clear.contains("Max-Age=0"), "{clear}");
+
+        let host_only = SessionConfig::from_set_cookie("app.sid=x; Path=/").expect("config");
+        assert_eq!(host_only.domain, None);
     }
 }
