@@ -5023,6 +5023,33 @@ fn register_dev_capture_functions(linker: &mut Linker<WasmState>) -> RuntimeResu
     Ok(())
 }
 
+/// Read the next newline-delimited JSON-RPC message for `_mcp_stdio_read`.
+///
+/// Returns the message without its line ending, or an empty string at end of
+/// input (or on a read error). Blank and whitespace-only lines carry no
+/// message and are skipped: the empty string is the EOF signal of the
+/// `_mcp_stdio_read` contract, so returning it for a blank line would end the
+/// caller's read loop while the client is still connected.
+fn read_mcp_message<R: std::io::BufRead>(reader: &mut R) -> String {
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => return String::new(),
+            Ok(_) => {
+                let message = line.trim_end_matches(['\n', '\r']);
+                if !message.trim().is_empty() {
+                    return message.to_string();
+                }
+            }
+            Err(e) => {
+                error!("_mcp_stdio_read: {}", e);
+                return String::new();
+            }
+        }
+    }
+}
+
 /// Register MCP bridge functions (_mcp_stdio_read, _mcp_stdio_write, _mcp_http_serve,
 /// _mcp_http_accept, _mcp_http_respond, _mcp_sse_send, _mcp_log)
 fn register_mcp_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> {
@@ -5032,25 +5059,9 @@ fn register_mcp_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> {
         WasmState,
     >|
      -> i32 {
-        use std::io::BufRead;
-        let mut line = String::new();
-        match std::io::stdin().lock().read_line(&mut line) {
-            Ok(0) => write_string_to_caller(&mut caller, ""),
-            Ok(_) => {
-                if line.ends_with('\n') {
-                    line.pop();
-                    if line.ends_with('\r') {
-                        line.pop();
-                    }
-                }
-                debug!("_mcp_stdio_read: {} bytes", line.len());
-                write_string_to_caller(&mut caller, &line)
-            }
-            Err(e) => {
-                error!("_mcp_stdio_read: {}", e);
-                write_string_to_caller(&mut caller, "")
-            }
-        }
+        let message = read_mcp_message(&mut std::io::stdin().lock());
+        debug!("_mcp_stdio_read: {} bytes", message.len());
+        write_string_to_caller(&mut caller, &message)
     });
 
     // _mcp_stdio_write — write to stdout (stdio mode) or pending HTTP response (HTTP mode)
@@ -7248,6 +7259,21 @@ fn register_dot_aliases(linker: &mut Linker<WasmState>) -> RuntimeResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_stdio_read_skips_blank_lines_and_reports_eof_once() {
+        let mut input =
+            std::io::Cursor::new("{\"id\":1}\n\n   \r\n{\"id\":2}\r\n\n".as_bytes().to_vec());
+        assert_eq!(read_mcp_message(&mut input), "{\"id\":1}");
+        // A blank or whitespace-only line carries no message: it must not
+        // read as end of input.
+        assert_eq!(read_mcp_message(&mut input), "{\"id\":2}");
+        assert_eq!(read_mcp_message(&mut input), "");
+        // A last message without a trailing newline is still a message.
+        let mut tail = std::io::Cursor::new(b"{\"id\":3}".to_vec());
+        assert_eq!(read_mcp_message(&mut tail), "{\"id\":3}");
+        assert_eq!(read_mcp_message(&mut tail), "");
+    }
 
     #[test]
     fn text_responses_say_they_are_utf8() {
