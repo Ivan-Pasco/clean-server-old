@@ -1452,14 +1452,44 @@ impl WasmInstance {
         crate::memory::read_string_from_memory(&store, &memory, result_ptr as u32).map(Some)
     }
 
+    /// Call a module export of shape `() -> boolean` on a fresh request-like
+    /// instance carrying the startup state. `Ok(None)` when the export is
+    /// absent or has another signature.
+    fn call_bool_export(&self, name: &str) -> RuntimeResult<Option<bool>> {
+        if !self.has_export(name) {
+            return Ok(None);
+        }
+        let (mut store, instance) = self.create_instance()?;
+        let func = match instance.get_typed_func::<(), i32>(&mut store, name) {
+            Ok(f) => f,
+            Err(_) => return Ok(None),
+        };
+        let value = func
+            .call(&mut store, ())
+            .map_err(|e| RuntimeError::wasm(format!("{} trapped: {}", name, e)))?;
+        Ok(Some(value != 0))
+    }
+
     /// Adopt the application's `auth: session:` settings (cookie name,
-    /// path, SameSite, Secure, HttpOnly, timeout) for the host session store.
+    /// path, domain, SameSite, Secure, HttpOnly, timeout) and its `auth:
+    /// csrf:` setting for the host session store.
     ///
-    /// frame.auth bakes these settings into its generated
+    /// frame.auth bakes the cookie settings into its generated
     /// `__auth_build_cookie_header(sessionId)` helper, so the host calls it
-    /// once after startup and parses the `Set-Cookie` value it returns.
-    /// Modules without frame.auth keep `SessionConfig::default()`.
+    /// once after startup and parses the `Set-Cookie` value it returns; its
+    /// `__auth_csrf_enabled()` helper answers whether session-authenticated
+    /// mutating requests need a CSRF token. Modules without frame.auth keep
+    /// `SessionConfig::default()` and no CSRF enforcement.
     pub fn configure_session_from_module(&self) {
+        match self.call_bool_export("__auth_csrf_enabled") {
+            Ok(Some(enabled)) => self
+                .session_store
+                .write()
+                .expect("session store lock poisoned")
+                .set_csrf_enabled(enabled),
+            Ok(None) => {}
+            Err(e) => warn!("Could not read the CSRF setting: {}", e),
+        }
         const HELPER: &str = "__auth_build_cookie_header";
         match self.call_string_export(HELPER, Some("probe")) {
             Ok(Some(header)) => match SessionConfig::from_set_cookie(&header) {

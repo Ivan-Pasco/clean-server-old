@@ -1107,6 +1107,16 @@ async fn handle_request_inner(
         }
     }
 
+    // CSRF protection for session-authenticated mutating requests.
+    if let Some(rejection) = csrf_failure(
+        &method,
+        &headers,
+        &body_bytes,
+        auth_context.as_ref(),
+        &state.wasm,
+    ) {
+        return rejection;
+    }
     // The session the request's cookie resolved, kept alive below.
     let cookie_session_id = auth_context.as_ref().and_then(|a| a.session_id.clone());
 
@@ -1407,6 +1417,122 @@ fn keep_session_cookie_alive(
     }
 }
 
+/// CSRF protection (AUTH-S006 / AUTH-S007, frame.auth `csrf: enabled`, on
+/// by default). A POST / PUT / PATCH / DELETE request authenticated by the
+/// session cookie must carry the session's CSRF token, in the `X-CSRF-Token`
+/// header or as the `_csrf` field of a form body (the hidden input frame.ui
+/// adds to non-GET forms). Requests without a session cookie and
+/// bearer-token (JWT) requests are exempt: their credentials are not
+/// attached by the browser to a cross-site request. Returns the 403 response
+/// for a request that fails the check.
+fn csrf_failure(
+    method: &Method,
+    headers: &HeaderMap,
+    body: &[u8],
+    auth: Option<&AuthContext>,
+    wasm: &WasmInstance,
+) -> Option<Response> {
+    if !matches!(
+        *method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    ) {
+        return None;
+    }
+    let session_id = auth?.session_id.as_deref()?;
+    let expected = {
+        let store = wasm.session_store().read().expect("store lock poisoned");
+        if !store.csrf_enabled() {
+            return None;
+        }
+        store.get_csrf(session_id)
+    };
+    let provided = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_string())
+        .or_else(|| csrf_form_field(headers, body));
+    let valid = match (expected, provided) {
+        (Some(expected), Some(provided)) => {
+            !expected.is_empty() && constant_time_eq(expected.as_bytes(), provided.as_bytes())
+        }
+        _ => false,
+    };
+    if valid {
+        return None;
+    }
+    debug!("CSRF token missing or invalid for session {}", session_id);
+    Some(
+        Response::builder()
+            .status(StatusCode::FORBIDDEN)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"ok":false,"err":{"code":"CSRF_FAIL","message":"CSRF token missing or invalid"}}"#,
+            ))
+            .expect("response builder"),
+    )
+}
+
+/// The `_csrf` field of an `application/x-www-form-urlencoded` or
+/// `multipart/form-data` request body.
+fn csrf_form_field(headers: &HeaderMap, body: &[u8]) -> Option<String> {
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())?;
+    let mime = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match mime.as_str() {
+        "application/x-www-form-urlencoded" => url::form_urlencoded::parse(body)
+            .find(|(k, _)| k == "_csrf")
+            .map(|(_, v)| v.into_owned()),
+        "multipart/form-data" => {
+            let boundary = content_type.split(';').skip(1).find_map(|param| {
+                let (k, v) = param.split_once('=')?;
+                k.trim()
+                    .eq_ignore_ascii_case("boundary")
+                    .then(|| v.trim().trim_matches('"').to_string())
+            })?;
+            multipart_field(body, &boundary, "_csrf")
+        }
+        _ => None,
+    }
+}
+
+/// The value of the form field `name` in a multipart/form-data body.
+fn multipart_field(body: &[u8], boundary: &str, name: &str) -> Option<String> {
+    let text = String::from_utf8_lossy(body);
+    let delimiter = format!("--{}", boundary);
+    for part in text.split(delimiter.as_str()) {
+        let part = part.strip_prefix("\r\n").unwrap_or(part);
+        let Some((head, value)) = part.split_once("\r\n\r\n") else {
+            continue;
+        };
+        let names_field = head.lines().any(|line| {
+            let mut fields = line.split(';').map(str::trim);
+            fields
+                .next()
+                .is_some_and(|h| h.to_ascii_lowercase().starts_with("content-disposition:"))
+                && fields.any(|param| {
+                    param.split_once('=').is_some_and(|(k, v)| {
+                        k.trim() == "name" && v.trim().trim_matches('"') == name
+                    })
+                })
+        });
+        if names_field {
+            return Some(value.strip_suffix("\r\n").unwrap_or(value).to_string());
+        }
+    }
+    None
+}
+
+/// Compare two byte strings in time that does not depend on where they differ.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 /// Resolve the caller's identity for a request.
 ///
 /// 1. The session cookie, under the application's configured cookie name
@@ -1652,6 +1778,105 @@ mod tests {
             .unwrap()
             .store_raw("s1", r#"{"userId":5,"claims":{"role":"user"}}"#);
         wasm
+    }
+
+    /// frame.auth with `csrf: enabled` (the default) and a session `s1`
+    /// whose CSRF token is `tok-1`.
+    fn csrf_app() -> WasmInstance {
+        let wasm =
+            session_app(r#"(func (export "__auth_csrf_enabled") (result i32) (i32.const 1))"#);
+        wasm.session_store()
+            .write()
+            .unwrap()
+            .set_csrf("s1", "tok-1");
+        wasm
+    }
+
+    fn cookie_auth(session_id: &str) -> AuthContext {
+        AuthContext {
+            user_id: 5,
+            role: "user".to_string(),
+            session_id: Some(session_id.to_string()),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_authenticated_mutations_need_the_csrf_token() {
+        let wasm = csrf_app();
+        let auth = cookie_auth("s1");
+        let fails =
+            |method: Method, headers: &HeaderMap, body: &str, auth: Option<&AuthContext>| {
+                csrf_failure(&method, headers, body.as_bytes(), auth, &wasm).map(|r| r.status())
+            };
+        let none = HeaderMap::new();
+
+        // No token, a wrong token: 403 for every mutating method.
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            assert_eq!(
+                fails(method, &none, "", Some(&auth)),
+                Some(StatusCode::FORBIDDEN)
+            );
+        }
+        let wrong = headers(&[(header::HeaderName::from_static("x-csrf-token"), "tok-2")]);
+        assert_eq!(
+            fails(Method::POST, &wrong, "", Some(&auth)),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        // The X-CSRF-Token header, or the _csrf field of a form body.
+        let good = headers(&[(header::HeaderName::from_static("x-csrf-token"), "tok-1")]);
+        assert_eq!(fails(Method::POST, &good, "", Some(&auth)), None);
+        let form = headers(&[(header::CONTENT_TYPE, "application/x-www-form-urlencoded")]);
+        assert_eq!(
+            fails(Method::POST, &form, "name=a&_csrf=tok-1", Some(&auth)),
+            None
+        );
+        assert_eq!(
+            fails(Method::POST, &form, "name=a&_csrf=tok-2", Some(&auth)),
+            Some(StatusCode::FORBIDDEN)
+        );
+        let multipart = headers(&[(header::CONTENT_TYPE, "multipart/form-data; boundary=XyZ")]);
+        let body = "--XyZ\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nhello\r\n--XyZ\r\nContent-Disposition: form-data; name=\"_csrf\"\r\n\r\ntok-1\r\n--XyZ--\r\n";
+        assert_eq!(fails(Method::POST, &multipart, body, Some(&auth)), None);
+
+        // GET / HEAD, requests without a session cookie and bearer-token
+        // requests need no token (AUTH-S007).
+        assert_eq!(fails(Method::GET, &none, "", Some(&auth)), None);
+        assert_eq!(fails(Method::HEAD, &none, "", Some(&auth)), None);
+        assert_eq!(fails(Method::POST, &none, "", None), None);
+        let bearer = AuthContext {
+            session_id: None,
+            ..cookie_auth("s1")
+        };
+        assert_eq!(fails(Method::POST, &none, "", Some(&bearer)), None);
+
+        // A session without a CSRF token cannot pass the check.
+        wasm.session_store()
+            .write()
+            .unwrap()
+            .store_raw("s2", r#"{"userId":6,"claims":{}}"#);
+        let empty = headers(&[(header::HeaderName::from_static("x-csrf-token"), "")]);
+        assert_eq!(
+            fails(Method::POST, &empty, "", Some(&cookie_auth("s2"))),
+            Some(StatusCode::FORBIDDEN)
+        );
+
+        // csrf: enabled = false turns the check off.
+        wasm.session_store()
+            .write()
+            .unwrap()
+            .set_csrf_enabled(false);
+        assert_eq!(fails(Method::POST, &none, "", Some(&auth)), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn csrf_setting_is_read_from_the_module() {
+        assert!(csrf_app().session_store().read().unwrap().csrf_enabled());
+        let without =
+            WasmInstance::from_bytes(&auth_module(), crate::router::create_shared_router())
+                .expect("load module");
+        without.initialize().expect("initialize");
+        assert!(!without.session_store().read().unwrap().csrf_enabled());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

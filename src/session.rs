@@ -244,6 +244,10 @@ pub struct SessionStore {
     password_resets: HashMap<String, (i32, Instant)>,
     /// Configuration
     config: SessionConfig,
+    /// Whether the application protects session-authenticated
+    /// POST/PUT/PATCH/DELETE requests with a CSRF token (frame.auth
+    /// `csrf: enabled`, on by default; AUTH-S006 / AUTH-S007).
+    csrf_enabled: bool,
 }
 
 impl SessionStore {
@@ -255,18 +259,34 @@ impl SessionStore {
             consumed_jti: HashMap::new(),
             password_resets: HashMap::new(),
             config,
+            csrf_enabled: false,
         }
     }
 
-    /// Create a new session
+    /// Create a new session. With CSRF protection on, the session gets its
+    /// CSRF token at once (AUTH-S006), so its first form already carries one.
     pub fn create(&mut self, user_id: i32, role: &str, claims: &str) -> SessionData {
         let session = SessionData::new(user_id, role.to_string(), claims.to_string());
         let session_id = session.session_id.clone();
 
         info!("Creating session {} for user {}", session_id, user_id);
+        if self.csrf_enabled {
+            self.csrf_tokens
+                .insert(session_id.clone(), new_csrf_token());
+        }
         self.sessions.insert(session_id, session.clone());
 
         session
+    }
+
+    /// Turn CSRF enforcement for session-authenticated requests on or off.
+    pub fn set_csrf_enabled(&mut self, enabled: bool) {
+        self.csrf_enabled = enabled;
+    }
+
+    /// Whether session-authenticated mutating requests need a CSRF token.
+    pub fn csrf_enabled(&self) -> bool {
+        self.csrf_enabled
     }
 
     /// Get a session by ID
@@ -556,6 +576,12 @@ impl SessionStore {
     pub fn is_empty(&self) -> bool {
         self.sessions.is_empty()
     }
+}
+
+/// A fresh random CSRF token: 64 hex characters from two v4 UUIDs (OS
+/// randomness).
+fn new_csrf_token() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
 /// Shared session store type
@@ -855,6 +881,20 @@ mod tests {
 
         let host_only = SessionConfig::from_set_cookie("app.sid=x; Path=/").expect("config");
         assert_eq!(host_only.domain, None);
+    }
+
+    #[test]
+    fn test_typed_session_gets_a_csrf_token_when_protection_is_on() {
+        let mut store = SessionStore::new(SessionConfig::default());
+        let plain = store.create(1, "user", "{}");
+        assert_eq!(store.get_csrf(&plain.session_id), None);
+
+        store.set_csrf_enabled(true);
+        let protected = store.create(2, "user", "{}");
+        let token = store.get_csrf(&protected.session_id).expect("csrf token");
+        assert_eq!(token.len(), 64);
+        let other = store.create(3, "user", "{}");
+        assert_ne!(store.get_csrf(&other.session_id), Some(token));
     }
 
     #[test]
