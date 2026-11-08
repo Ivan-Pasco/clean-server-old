@@ -288,6 +288,10 @@ pub struct WasmState {
     pub next_test_handle: i32,
     /// SSE sender for STREAM route handlers — set by the server before calling the handler
     pub sse_sender: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// Tasks handed over by `_async_fire_slot` (`background` / `later`), as
+    /// `(slot, env)`. They run in order once the entry point that started
+    /// them has returned (`run_async_tasks`, HOST_BRIDGE.md §Async).
+    pub async_tasks: std::collections::VecDeque<(i32, i32)>,
     /// SMTP configuration and last-error state for email bridge functions
     pub smtp_state: SharedSmtpState,
     /// Shared WebSocket server state (connections, rooms, route registry).
@@ -489,6 +493,7 @@ impl WasmState {
             test_responses: std::collections::HashMap::new(),
             next_test_handle: 0,
             sse_sender: None,
+            async_tasks: std::collections::VecDeque::new(),
             smtp_state: create_shared_smtp_state(),
             ws_state: crate::websocket::create_shared_ws_state(),
             jobs_state: crate::jobs::create_shared_jobs_state(),
@@ -529,6 +534,7 @@ impl WasmState {
             test_responses: std::collections::HashMap::new(),
             next_test_handle: 0,
             sse_sender: None,
+            async_tasks: std::collections::VecDeque::new(),
             smtp_state: create_shared_smtp_state(),
             ws_state: crate::websocket::create_shared_ws_state(),
             jobs_state: crate::jobs::create_shared_jobs_state(),
@@ -579,6 +585,7 @@ impl WasmState {
             test_responses: std::collections::HashMap::new(),
             next_test_handle: 0,
             sse_sender: None,
+            async_tasks: std::collections::VecDeque::new(),
             smtp_state: create_shared_smtp_state(),
             ws_state: crate::websocket::create_shared_ws_state(),
             jobs_state: crate::jobs::create_shared_jobs_state(),
@@ -1072,6 +1079,10 @@ impl WasmInstance {
                 func.call(&mut store, ())
                     .map_err(|e| RuntimeError::wasm(format!("Failed to call {}: {}", name, e)))?;
 
+                // Tasks `start:` handed over run now, before the snapshot, so
+                // what they change is part of the startup state.
+                run_async_tasks(&mut store, &instance);
+
                 // Capture the post-startup state for per-request instances.
                 let snapshot = crate::startup_snapshot::StartupSnapshot::capture(
                     &mut store,
@@ -1141,6 +1152,7 @@ impl WasmInstance {
 
             let result =
                 crate::memory::read_string_from_memory(&store, &memory, result_ptr as u32)?;
+            finish_async_tasks(store, instance);
 
             return Ok(result);
         }
@@ -1226,6 +1238,10 @@ impl WasmInstance {
         let status = store.data_mut().take_pending_status();
         let head_links = store.data_mut().take_pending_head_links();
 
+        // The response is complete: tasks the handler started run after it,
+        // off the request path.
+        finish_async_tasks(store, instance);
+
         Ok(HandlerResponse {
             body: result,
             set_cookie,
@@ -1263,6 +1279,8 @@ impl WasmInstance {
             let _ = handler.call(&mut store, ()).map_err(|e| {
                 RuntimeError::wasm(format!("SSE handler {} failed: {}", handler_name, e))
             });
+            // Tasks the handler started can still emit before the stream closes.
+            run_async_tasks(&mut store, &instance);
         } else {
             return Err(RuntimeError::wasm(format!(
                 "Could not find or call SSE handler '{}'",
@@ -1310,6 +1328,7 @@ impl WasmInstance {
                     handler_name, e
                 ))
             })?;
+            run_async_tasks(&mut store, &instance);
             return Ok(());
         }
 
@@ -1320,6 +1339,7 @@ impl WasmInstance {
                     handler_name, e
                 ))
             })?;
+            run_async_tasks(&mut store, &instance);
             return Ok(());
         }
 
@@ -1367,6 +1387,7 @@ impl WasmInstance {
                     handler_name, e
                 ))
             })?;
+            run_async_tasks(&mut store, &instance);
             return Ok(());
         }
 
@@ -1377,6 +1398,7 @@ impl WasmInstance {
                     handler_name, e
                 ))
             })?;
+            run_async_tasks(&mut store, &instance);
             return Ok(());
         }
 
@@ -1553,6 +1575,56 @@ pub fn create_shared_instance_with_config(
     let instance =
         WasmInstance::load_with_db_and_limit(wasm_path, router, db_bridge, memory_limit)?;
     Ok(Arc::new(instance))
+}
+
+/// Run the tasks the entry point just called handed over with
+/// `_async_fire_slot`, in order, including the ones those tasks start
+/// (HOST_BRIDGE.md §Async). A task is the function at its `slot` in
+/// `__indirect_function_table`, called with its environment block; one that
+/// traps is logged and the rest still run — a task's failure does not reach
+/// the code that started it (specification 19-async.md).
+pub fn run_async_tasks(store: &mut Store<WasmState>, instance: &Instance) {
+    while let Some((slot, env)) = store.data_mut().async_tasks.pop_front() {
+        let result = async_task_function(&mut *store, instance, slot)
+            .and_then(|task| task.call(&mut *store, env).map_err(|e| e.to_string()));
+        if let Err(e) = result {
+            warn!("background task (slot {}) failed: {}", slot, e);
+        }
+    }
+}
+
+/// Run a finished handler's tasks off the request path: on the blocking
+/// thread pool when a Tokio runtime is available (so the response is not
+/// held back), otherwise right away.
+fn finish_async_tasks(mut store: Store<WasmState>, instance: Instance) {
+    if store.data().async_tasks.is_empty() {
+        return;
+    }
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(move || run_async_tasks(&mut store, &instance));
+        }
+        Err(_) => run_async_tasks(&mut store, &instance),
+    }
+}
+
+/// The task function `(env: i32) -> i32` at `slot` of the module's
+/// `__indirect_function_table`.
+fn async_task_function(
+    mut store: impl wasmtime::AsContextMut<Data = WasmState>,
+    instance: &Instance,
+    slot: i32,
+) -> Result<wasmtime::TypedFunc<i32, i32>, String> {
+    let table = instance
+        .get_table(&mut store, "__indirect_function_table")
+        .ok_or_else(|| "module exports no __indirect_function_table".to_string())?;
+    let func = u64::try_from(slot)
+        .ok()
+        .and_then(|index| table.get(&mut store, index))
+        .and_then(|entry| entry.as_func().flatten().copied())
+        .ok_or_else(|| format!("async task slot {} holds no function", slot))?;
+    func.typed::<i32, i32>(&store)
+        .map_err(|e| format!("async task slot {} has the wrong signature: {}", slot, e))
 }
 
 #[cfg(test)]
