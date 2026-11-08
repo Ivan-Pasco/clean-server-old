@@ -255,7 +255,7 @@ pub struct WasmState {
     pub open_transaction: Option<host_bridge::OpenTransaction>,
     /// Cached last_insert_id from the most recent INSERT in this request.
     /// The DB driver acquires a fresh pooled connection per query, so
-    /// MySQL's `LAST_INSERT_ID()` and SQLite's `LAST_INSERT_ROWID()` are
+    /// `LAST_INSERT_ID()` and SQLite's `LAST_INSERT_ROWID()` are
     /// invisible to a follow-up call. The bridge caches the value here
     /// and serves it back when the caller asks for it.
     pub last_insert_id: Option<i64>,

@@ -234,6 +234,11 @@ CLEAN_SERVER_CORS_ORIGIN=https://example.com
 CLEAN_SERVER_MAX_REQUEST_SIZE=10
 ```
 
+`DATABASE_URL` (or `--database`) accepts PostgreSQL (`postgres://`,
+`postgresql://`) and SQLite (`sqlite:app.db`, `sqlite::memory:`). MySQL and
+MariaDB are not supported: a `mysql://` URL, or any other scheme, stops the
+server at startup with an error naming the supported databases.
+
 ### Production Deployment
 
 #### Systemd Service (Linux)
@@ -429,7 +434,7 @@ clean-server/
 │       ├── lib.rs                    # Public crate exports
 │       ├── error.rs                  # Bridge error types
 │       ├── http.rs                   # HTTP client (reqwest-backed)
-│       ├── db.rs                     # SQL adapters (PG / MySQL / SQLite)
+│       ├── db.rs                     # SQL adapters (PostgreSQL / SQLite)
 │       ├── crypto.rs                 # Hashing, HMAC, UUID, JWT
 │       ├── env.rs                    # Environment variable access
 │       ├── time.rs                   # Epoch + ISO + timezone
