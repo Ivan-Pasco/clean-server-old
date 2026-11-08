@@ -66,7 +66,7 @@ pub trait WasmStateCore: Send + 'static {
 
     /// Get the last_insert_id cached from the most recent INSERT in this
     /// WASM state's lifetime. Because the DB driver acquires a fresh pooled
-    /// connection per query, a session-local `LAST_INSERT_ID()` and
+    /// connection per query, MySQL's session-local `LAST_INSERT_ID()` and
     /// SQLite's `LAST_INSERT_ROWID()` cannot be observed by a follow-up
     /// query. The bridge therefore caches the value returned by the driver
     /// alongside the INSERT and serves it back when the caller asks for it.

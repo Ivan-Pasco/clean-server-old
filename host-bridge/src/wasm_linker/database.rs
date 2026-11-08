@@ -37,7 +37,7 @@ thread_local! {
 /// synthetic single-row response. Returns `None` if the SQL is not a bare
 /// `LAST_INSERT_ID()` / `LAST_INSERT_ROWID()` query.
 ///
-/// `LAST_INSERT_ID()` and SQLite's `LAST_INSERT_ROWID()` are
+/// MySQL's `LAST_INSERT_ID()` and SQLite's `LAST_INSERT_ROWID()` are
 /// session-local. The bridge dispatches each query against a fresh pooled
 /// connection, so the id from the prior INSERT is invisible to a follow-up
 /// SELECT. To preserve the documented contract from the caller's perspective

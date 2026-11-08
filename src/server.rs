@@ -21,7 +21,7 @@ use axum::{
     http::{HeaderMap, Method, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
-use host_bridge::{DbBridge, DbConfig, check_database_url};
+use host_bridge::{DbBridge, DbConfig};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -419,22 +419,10 @@ const LOADER_JS: &str = r#"(function() {
 })();
 "#;
 
-/// Set up the database bridge from `DATABASE_URL` / `--database`.
-///
-/// A URL for an engine clean-server does not support (MySQL, or any other
-/// scheme) is a configuration error and stops startup. A supported database
-/// that cannot be reached only disables database features, as before.
-async fn configure_db_bridge(config: &ServerConfig) -> RuntimeResult<SharedDbBridge> {
+async fn configure_db_bridge(config: &ServerConfig) -> SharedDbBridge {
     let db_bridge: SharedDbBridge = Arc::new(TokioRwLock::new(DbBridge::new()));
 
     if let Some(ref db_url) = config.database_url {
-        if let Err(e) = check_database_url(db_url) {
-            return Err(RuntimeError::config(format!(
-                "DATABASE_URL {}: {}",
-                mask_db_url(db_url),
-                e
-            )));
-        }
         info!("Configuring database connection: {}", mask_db_url(db_url));
         let db_config = DbConfig {
             database_url: db_url.clone(),
@@ -455,7 +443,7 @@ async fn configure_db_bridge(config: &ServerConfig) -> RuntimeResult<SharedDbBri
         info!("No DATABASE_URL configured. Database features disabled.");
     }
 
-    Ok(db_bridge)
+    db_bridge
 }
 
 /// Start the HTTP server with the given WASM module
@@ -467,7 +455,7 @@ pub async fn start_server(wasm_path: PathBuf, mut config: ServerConfig) -> Runti
     let router = crate::router::create_shared_router();
 
     // Configure database bridge
-    let db_bridge = configure_db_bridge(&config).await?;
+    let db_bridge = configure_db_bridge(&config).await;
 
     // Load WASM module with database bridge and memory limit
     let wasm = crate::wasm::create_shared_instance_with_config(
@@ -1658,28 +1646,6 @@ fn inject_head_tags(body: String, links: Vec<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn startup_rejects_a_mysql_database_url() {
-        let config = ServerConfig::default().with_database("mysql://u:p@localhost:3306/app");
-        let err = match configure_db_bridge(&config).await {
-            Ok(_) => panic!("a mysql:// DATABASE_URL must stop startup"),
-            Err(e) => e.to_string(),
-        };
-        assert!(err.contains("Configuration error"), "{err}");
-        assert!(err.contains("MySQL is not supported"), "{err}");
-        assert!(
-            err.contains("PostgreSQL") && err.contains("SQLite"),
-            "{err}"
-        );
-        assert!(!err.contains(":p@"), "password must be masked: {err}");
-    }
-
-    #[tokio::test]
-    async fn startup_accepts_a_sqlite_database_url() {
-        let config = ServerConfig::default().with_database("sqlite::memory:");
-        assert!(configure_db_bridge(&config).await.is_ok());
-    }
 
     /// Lay out `s` as a WAT data string of a Clean length-prefixed string.
     fn lp_data(s: &str) -> String {

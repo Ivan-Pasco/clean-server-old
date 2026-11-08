@@ -13,10 +13,7 @@ mod time;
 pub mod wasm_linker;
 
 pub use crypto::CryptoBridge;
-pub use db::{
-    check_database_url, DatabaseKind, DbBridge, DbConfig, DbQuery, DbResult, OpenTransaction,
-    SUPPORTED_DATABASE_URLS,
-};
+pub use db::{DbBridge, DbConfig, DbQuery, DbResult, OpenTransaction};
 pub use env::EnvBridge;
 pub use error::{BridgeError as WasmBridgeError, BridgeResult};
 pub use fs::FsBridge;

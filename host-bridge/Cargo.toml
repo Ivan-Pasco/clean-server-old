@@ -17,7 +17,7 @@ async-trait = "0.1"
 wasmtime = "26.0"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "sqlite", "uuid", "chrono", "json"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "sqlite", "mysql", "uuid", "chrono", "json"] }
 
 # Utilities
 uuid = { version = "1.6", features = ["v4", "serde"] }

@@ -1,6 +1,7 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column, Row, TypeInfo};
@@ -15,82 +16,54 @@ use uuid::Uuid;
 // DATABASE DRIVER - Native driver with runtime dispatch
 // ============================================================================
 
-/// The database engines clean-server (and frame.data) support.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DatabaseKind {
-    /// `postgres://` or `postgresql://`
-    Postgres,
-    /// `sqlite:` (`sqlite::memory:`, `sqlite:app.db`, `sqlite://path`)
-    Sqlite,
-}
-
-/// The URL forms accepted for `DATABASE_URL` / `--database`.
-pub const SUPPORTED_DATABASE_URLS: &str =
-    "PostgreSQL (postgres://, postgresql://) and SQLite (sqlite:)";
-
-/// Check that `url` names a supported database engine, without connecting.
-///
-/// MySQL and MariaDB are rejected by name: frame.data generates
-/// PostgreSQL/SQLite SQL (`$n` placeholders, `INSERT ... RETURNING`), which
-/// MySQL does not accept, so a MySQL URL would start a server whose writes
-/// fail at run time.
-pub fn check_database_url(url: &str) -> Result<DatabaseKind> {
-    if url.starts_with("postgres://") || url.starts_with("postgresql://") {
-        return Ok(DatabaseKind::Postgres);
-    }
-    if url.starts_with("sqlite:") {
-        return Ok(DatabaseKind::Sqlite);
-    }
-    if url.starts_with("mysql:") || url.starts_with("mariadb:") {
-        return Err(anyhow::anyhow!(
-            "MySQL is not supported. Supported databases: {}",
-            SUPPORTED_DATABASE_URLS
-        ));
-    }
-    let scheme = url.split(':').next().unwrap_or("");
-    Err(anyhow::anyhow!(
-        "unsupported database URL scheme '{}'. Supported databases: {}",
-        scheme,
-        SUPPORTED_DATABASE_URLS
-    ))
-}
-
 /// Native database driver with full type support
-/// Dispatches to PostgreSQL or SQLite based on connection URL
-/// (see [`check_database_url`]; MySQL is not supported)
+/// Dispatches to PostgreSQL, MySQL, or SQLite based on connection URL
 #[derive(Clone)]
 pub enum DatabaseDriver {
     Postgres(PgPool),
+    MySql(MySqlPool),
     Sqlite(SqlitePool),
 }
 
 impl DatabaseDriver {
     /// Connect to a database based on the URL scheme
     pub async fn connect(url: &str, config: &DbConfig) -> Result<Self> {
-        match check_database_url(url)? {
-            DatabaseKind::Postgres => {
-                let pool = PgPoolOptions::new()
-                    .max_connections(config.max_connections)
-                    .min_connections(config.min_connections)
-                    .acquire_timeout(Duration::from_millis(config.connection_timeout))
-                    .idle_timeout(Duration::from_secs(90))
-                    .max_lifetime(Duration::from_secs(1800))
-                    .test_before_acquire(true)
-                    .connect(url)
-                    .await?;
-                Ok(Self::Postgres(pool))
-            }
-            DatabaseKind::Sqlite => {
-                let pool = SqlitePoolOptions::new()
-                    .max_connections(config.max_connections)
-                    .min_connections(config.min_connections)
-                    .acquire_timeout(Duration::from_millis(config.connection_timeout))
-                    .idle_timeout(Duration::from_secs(90))
-                    .test_before_acquire(true)
-                    .connect(url)
-                    .await?;
-                Ok(Self::Sqlite(pool))
-            }
+        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            let pool = PgPoolOptions::new()
+                .max_connections(config.max_connections)
+                .min_connections(config.min_connections)
+                .acquire_timeout(Duration::from_millis(config.connection_timeout))
+                .idle_timeout(Duration::from_secs(90))
+                .max_lifetime(Duration::from_secs(1800))
+                .test_before_acquire(true)
+                .connect(url)
+                .await?;
+            Ok(Self::Postgres(pool))
+        } else if url.starts_with("mysql://") || url.starts_with("mariadb://") {
+            let pool = MySqlPoolOptions::new()
+                .max_connections(config.max_connections)
+                .min_connections(config.min_connections)
+                .acquire_timeout(Duration::from_millis(config.connection_timeout))
+                .idle_timeout(Duration::from_secs(90))
+                .max_lifetime(Duration::from_secs(1800))
+                .test_before_acquire(true)
+                .connect(url)
+                .await?;
+            Ok(Self::MySql(pool))
+        } else if url.starts_with("sqlite://") || url.starts_with("sqlite:") {
+            let pool = SqlitePoolOptions::new()
+                .max_connections(config.max_connections)
+                .min_connections(config.min_connections)
+                .acquire_timeout(Duration::from_millis(config.connection_timeout))
+                .idle_timeout(Duration::from_secs(90))
+                .test_before_acquire(true)
+                .connect(url)
+                .await?;
+            Ok(Self::Sqlite(pool))
+        } else {
+            Err(anyhow::anyhow!(
+                "Unsupported database URL scheme. Supported: postgres://, mysql://, sqlite://"
+            ))
         }
     }
 
@@ -101,7 +74,7 @@ impl DatabaseDriver {
     pub fn host_sql(&self, sql: &str) -> String {
         match self {
             Self::Postgres(_) => number_placeholders(sql),
-            Self::Sqlite(_) => sql.to_string(),
+            Self::MySql(_) | Self::Sqlite(_) => sql.to_string(),
         }
     }
 
@@ -113,6 +86,7 @@ impl DatabaseDriver {
     ) -> Result<Vec<serde_json::Map<String, Value>>> {
         match self {
             Self::Postgres(pool) => Self::query_postgres(pool, sql, params).await,
+            Self::MySql(pool) => Self::query_mysql(pool, sql, params).await,
             Self::Sqlite(pool) => Self::query_sqlite(pool, sql, params).await,
         }
     }
@@ -121,6 +95,7 @@ impl DatabaseDriver {
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult> {
         match self {
             Self::Postgres(pool) => Self::execute_postgres(pool, sql, params).await,
+            Self::MySql(pool) => Self::execute_mysql(pool, sql, params).await,
             Self::Sqlite(pool) => Self::execute_sqlite(pool, sql, params).await,
         }
     }
@@ -131,6 +106,7 @@ impl DatabaseDriver {
     pub async fn begin(&self) -> Result<OpenTransaction> {
         Ok(match self {
             Self::Postgres(pool) => OpenTransaction::Postgres(pool.begin().await?),
+            Self::MySql(pool) => OpenTransaction::MySql(pool.begin().await?),
             Self::Sqlite(pool) => OpenTransaction::Sqlite(pool.begin().await?),
         })
     }
@@ -139,6 +115,7 @@ impl DatabaseDriver {
     pub async fn execute_transaction(&self, operations: &[(String, Vec<Value>)]) -> Result<()> {
         match self {
             Self::Postgres(pool) => Self::execute_transaction_postgres(pool, operations).await,
+            Self::MySql(pool) => Self::execute_transaction_mysql(pool, operations).await,
             Self::Sqlite(pool) => Self::execute_transaction_sqlite(pool, operations).await,
         }
     }
@@ -359,6 +336,183 @@ impl DatabaseDriver {
     }
 
     // ========================================================================
+    // MySQL Implementation
+    // ========================================================================
+
+    async fn query_mysql<'c, E>(
+        executor: E,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<Vec<serde_json::Map<String, Value>>>
+    where
+        E: sqlx::Executor<'c, Database = sqlx::MySql>,
+    {
+        let mut query = sqlx::query(sql);
+
+        for param in params {
+            query = Self::bind_param_mysql(query, param);
+        }
+
+        let rows = query.fetch_all(executor).await?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            let map = Self::row_to_json_mysql(&row)?;
+            result.push(map);
+        }
+
+        Ok(result)
+    }
+
+    fn bind_param_mysql<'q>(
+        query: sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>,
+        param: &Value,
+    ) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
+        if let Some(dt) = Self::decode_typed_bind(param) {
+            return query.bind(dt);
+        }
+        match param {
+            Value::Null => query.bind(None::<String>),
+            Value::Bool(b) => query.bind(*b),
+            Value::Number(n) => {
+                if let Some(i) = n.as_i64() {
+                    query.bind(i)
+                } else if let Some(f) = n.as_f64() {
+                    query.bind(f)
+                } else {
+                    query.bind(n.to_string())
+                }
+            }
+            Value::String(s) => query.bind(s.clone()),
+            Value::Array(_) | Value::Object(_) => query.bind(param.to_string()),
+        }
+    }
+
+    fn row_to_json_mysql(row: &MySqlRow) -> Result<serde_json::Map<String, Value>> {
+        let mut map = serde_json::Map::new();
+
+        for (i, column) in row.columns().iter().enumerate() {
+            let name = column.name().to_string();
+            let type_info = column.type_info();
+            let type_name = type_info.name();
+
+            let value = match type_name {
+                "BOOLEAN" | "TINYINT(1)" | "BOOL" => {
+                    // MySQL stores booleans as TINYINT(1)
+                    row.try_get::<bool, _>(i)
+                        .or_else(|_| row.try_get::<i8, _>(i).map(|v| v != 0))
+                        .map(|v| json!(v))
+                        .unwrap_or(Value::Null)
+                }
+                "TINYINT" => row
+                    .try_get::<i8, _>(i)
+                    .map(|v| json!(v))
+                    .unwrap_or(Value::Null),
+                "SMALLINT" => row
+                    .try_get::<i16, _>(i)
+                    .map(|v| json!(v))
+                    .unwrap_or(Value::Null),
+                "INT" | "INTEGER" | "MEDIUMINT" => row
+                    .try_get::<i32, _>(i)
+                    .map(|v| json!(v))
+                    .unwrap_or(Value::Null),
+                "BIGINT" => row
+                    .try_get::<i64, _>(i)
+                    .map(|v| json!(v))
+                    .unwrap_or(Value::Null),
+                "FLOAT" => row
+                    .try_get::<f32, _>(i)
+                    .map(|v| json!(v))
+                    .unwrap_or(Value::Null),
+                "DOUBLE" => row
+                    .try_get::<f64, _>(i)
+                    .map(|v| json!(v))
+                    .unwrap_or(Value::Null),
+                "DECIMAL" | "NUMERIC" => {
+                    // Read as string to preserve precision
+                    row.try_get::<String, _>(i)
+                        .map(|v| json!(v))
+                        .unwrap_or(Value::Null)
+                }
+                "VARCHAR" | "CHAR" | "TEXT" | "TINYTEXT" | "MEDIUMTEXT" | "LONGTEXT" => row
+                    .try_get::<String, _>(i)
+                    .map(|v| json!(v))
+                    .unwrap_or(Value::Null),
+                "TIMESTAMP" | "DATETIME" => row
+                    .try_get::<chrono::NaiveDateTime, _>(i)
+                    .map(|v| json!(v.to_string()))
+                    .unwrap_or(Value::Null),
+                "DATE" => row
+                    .try_get::<chrono::NaiveDate, _>(i)
+                    .map(|v| json!(v.to_string()))
+                    .unwrap_or(Value::Null),
+                "TIME" => row
+                    .try_get::<chrono::NaiveTime, _>(i)
+                    .map(|v| json!(v.to_string()))
+                    .unwrap_or(Value::Null),
+                "JSON" => row
+                    .try_get::<serde_json::Value, _>(i)
+                    .unwrap_or(Value::Null),
+                "BLOB" | "TINYBLOB" | "MEDIUMBLOB" | "LONGBLOB" | "BINARY" | "VARBINARY" => row
+                    .try_get::<Vec<u8>, _>(i)
+                    .map(|v| {
+                        json!(base64::Engine::encode(
+                            &base64::engine::general_purpose::STANDARD,
+                            &v
+                        ))
+                    })
+                    .unwrap_or(Value::Null),
+                _ => {
+                    // Fallback: try to get as string
+                    row.try_get::<String, _>(i)
+                        .map(|v| json!(v))
+                        .unwrap_or(Value::Null)
+                }
+            };
+
+            map.insert(name, value);
+        }
+
+        Ok(map)
+    }
+
+    async fn execute_mysql<'c, E>(executor: E, sql: &str, params: &[Value]) -> Result<ExecuteResult>
+    where
+        E: sqlx::Executor<'c, Database = sqlx::MySql>,
+    {
+        let mut query = sqlx::query(sql);
+
+        for param in params {
+            query = Self::bind_param_mysql(query, param);
+        }
+
+        let result = query.execute(executor).await?;
+
+        Ok(ExecuteResult {
+            rows_affected: result.rows_affected(),
+            last_insert_id: Some(result.last_insert_id() as i64),
+        })
+    }
+
+    async fn execute_transaction_mysql(
+        pool: &MySqlPool,
+        operations: &[(String, Vec<Value>)],
+    ) -> Result<()> {
+        let mut tx = pool.begin().await?;
+
+        for (sql, params) in operations {
+            let mut query = sqlx::query(sql);
+            for param in params {
+                query = Self::bind_param_mysql(query, param);
+            }
+            query.execute(&mut *tx).await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    // ========================================================================
     // SQLite Implementation
     // ========================================================================
 
@@ -495,6 +649,7 @@ impl DatabaseDriver {
 /// `rollback` undoes them. Dropping it without committing rolls it back.
 pub enum OpenTransaction {
     Postgres(sqlx::Transaction<'static, sqlx::Postgres>),
+    MySql(sqlx::Transaction<'static, sqlx::MySql>),
     Sqlite(sqlx::Transaction<'static, sqlx::Sqlite>),
 }
 
@@ -507,6 +662,7 @@ impl OpenTransaction {
     ) -> Result<Vec<serde_json::Map<String, Value>>> {
         match self {
             Self::Postgres(tx) => DatabaseDriver::query_postgres(&mut **tx, sql, params).await,
+            Self::MySql(tx) => DatabaseDriver::query_mysql(&mut **tx, sql, params).await,
             Self::Sqlite(tx) => DatabaseDriver::query_sqlite(&mut **tx, sql, params).await,
         }
     }
@@ -515,6 +671,7 @@ impl OpenTransaction {
     pub async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<ExecuteResult> {
         match self {
             Self::Postgres(tx) => DatabaseDriver::execute_postgres(&mut **tx, sql, params).await,
+            Self::MySql(tx) => DatabaseDriver::execute_mysql(&mut **tx, sql, params).await,
             Self::Sqlite(tx) => DatabaseDriver::execute_sqlite(&mut **tx, sql, params).await,
         }
     }
@@ -523,6 +680,7 @@ impl OpenTransaction {
     pub async fn commit(self) -> Result<()> {
         match self {
             Self::Postgres(tx) => tx.commit().await?,
+            Self::MySql(tx) => tx.commit().await?,
             Self::Sqlite(tx) => tx.commit().await?,
         }
         Ok(())
@@ -532,6 +690,7 @@ impl OpenTransaction {
     pub async fn rollback(self) -> Result<()> {
         match self {
             Self::Postgres(tx) => tx.rollback().await?,
+            Self::MySql(tx) => tx.rollback().await?,
             Self::Sqlite(tx) => tx.rollback().await?,
         }
         Ok(())
@@ -541,7 +700,7 @@ impl OpenTransaction {
     fn host_sql(&self, sql: &str) -> String {
         match self {
             Self::Postgres(_) => number_placeholders(sql),
-            Self::Sqlite(_) => sql.to_string(),
+            Self::MySql(_) | Self::Sqlite(_) => sql.to_string(),
         }
     }
 }
@@ -758,7 +917,7 @@ impl DbBridge {
     /// Return the underlying SQLite pool when the configured driver is SQLite.
     ///
     /// Returns `None` when no database is configured, or when the driver is
-    /// PostgreSQL.  Used by the jobs runtime to write-through job
+    /// PostgreSQL or MySQL.  Used by the jobs runtime to write-through job
     /// records to the same pool without introducing a second connection.
     pub async fn get_sqlite_pool(&self) -> Option<sqlx::SqlitePool> {
         let guard = self.driver.read().await;
@@ -2266,8 +2425,8 @@ fn cursor_bind_value(after: &str, numeric: Option<bool>) -> Value {
 }
 
 /// Whether the cursor column has a numeric type. Known exactly on PostgreSQL
-/// (information_schema); SQLite coerces comparisons itself, so there the
-/// answer is `None` (unknown).
+/// (information_schema); SQLite and MySQL coerce comparisons themselves, so
+/// there the answer is `None` (unknown).
 async fn cursor_column_is_numeric(
     driver: &DatabaseDriver,
     table: &str,
@@ -2303,7 +2462,7 @@ async fn cursor_column_is_numeric(
                     | "double precision"
             ))
         }
-        DatabaseDriver::Sqlite(_) => None,
+        DatabaseDriver::MySql(_) | DatabaseDriver::Sqlite(_) => None,
     }
 }
 
@@ -2384,6 +2543,20 @@ async fn introspect_table_columns(driver: &DatabaseDriver, table: &str) -> Vec<S
                     .iter()
                     .filter_map(|r| {
                         r.get("column_name")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
+        }
+        DatabaseDriver::MySql(_) => {
+            let sql = "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 				WHERE TABLE_NAME = ? AND TABLE_SCHEMA = DATABASE() ORDER BY ORDINAL_POSITION";
+            match driver.query(sql, &[Value::String(table.to_string())]).await {
+                Ok(rows) => rows
+                    .iter()
+                    .filter_map(|r| {
+                        r.get("COLUMN_NAME")
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string())
                     })
@@ -2529,62 +2702,6 @@ mod tests {
 
     static TEST_DB_MUTEX: once_cell::sync::Lazy<Arc<AsyncMutex<()>>> =
         once_cell::sync::Lazy::new(|| Arc::new(AsyncMutex::new(())));
-
-    #[test]
-    fn database_urls_accept_only_postgres_and_sqlite() {
-        assert_eq!(
-            check_database_url("postgres://u:p@localhost/db").unwrap(),
-            DatabaseKind::Postgres
-        );
-        assert_eq!(
-            check_database_url("postgresql://localhost/db").unwrap(),
-            DatabaseKind::Postgres
-        );
-        assert_eq!(
-            check_database_url("sqlite::memory:").unwrap(),
-            DatabaseKind::Sqlite
-        );
-        assert_eq!(
-            check_database_url("sqlite://data/app.db").unwrap(),
-            DatabaseKind::Sqlite
-        );
-
-        for url in ["mysql://u:p@localhost:3306/db", "mariadb://localhost/db"] {
-            let msg = check_database_url(url).unwrap_err().to_string();
-            assert!(msg.contains("MySQL is not supported"), "{url}: {msg}");
-            assert!(
-                msg.contains("PostgreSQL") && msg.contains("SQLite"),
-                "{msg}"
-            );
-        }
-
-        let msg = check_database_url("oracle://localhost/db")
-            .unwrap_err()
-            .to_string();
-        assert!(msg.contains("'oracle'"), "{msg}");
-        assert!(
-            msg.contains("PostgreSQL") && msg.contains("SQLite"),
-            "{msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn configure_refuses_a_mysql_url() {
-        let mut bridge = DbBridge::new();
-        let err = bridge
-            .configure(DbConfig {
-                database_url: "mysql://u:p@localhost:3306/db".to_string(),
-                max_connections: 5,
-                min_connections: 1,
-                connection_timeout: 1000,
-                query_timeout: 1000,
-            })
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("MySQL is not supported"), "{err}");
-        assert!(bridge.get_driver().await.is_err());
-    }
 
     #[test]
     fn write_statements_include_ctes_that_end_in_a_write() {
@@ -3885,7 +4002,7 @@ mod frame_data_bridge_tests {
     }
 }
 
-/// Integration tests for PostgreSQL
+/// Integration tests for PostgreSQL and MySQL
 /// Run with: INTEGRATION_TESTS=1 cargo test integration --no-fail-fast -- --test-threads=1
 #[cfg(test)]
 mod integration_tests {
@@ -3913,6 +4030,29 @@ mod integration_tests {
             Ok(()) => Some(bridge),
             Err(e) => {
                 eprintln!("Failed to connect to PostgreSQL: {}", e);
+                None
+            }
+        }
+    }
+
+    async fn setup_mysql() -> Option<DbBridge> {
+        if skip_if_no_integration() {
+            return None;
+        }
+
+        let mut bridge = DbBridge::new();
+        let config = DbConfig {
+            database_url: "mysql://clean:cleanpass@localhost:3306/cleantest".to_string(),
+            max_connections: 5,
+            min_connections: 1,
+            connection_timeout: 10000,
+            query_timeout: 30000,
+        };
+
+        match bridge.configure(config).await {
+            Ok(()) => Some(bridge),
+            Err(e) => {
+                eprintln!("Failed to connect to MySQL: {}", e);
                 None
             }
         }
@@ -4026,6 +4166,118 @@ mod integration_tests {
         assert_eq!(result["data"]["rows"][0]["active"], true);
 
         println!("PostgreSQL JOIN test passed!");
+    }
+
+    #[tokio::test]
+    async fn integration_test_mysql_query() {
+        let Some(mut bridge) = setup_mysql().await else {
+            println!("Skipping MySQL integration test (set INTEGRATION_TESTS=1 to run)");
+            return;
+        };
+
+        // Query with all columns - native driver supports all types
+        let query = json!({
+            "sql": "SELECT * FROM users ORDER BY id",
+            "params": []
+        });
+
+        let result = bridge.call("query", query).await.unwrap();
+
+        assert_eq!(result["ok"], true, "MySQL query failed: {:?}", result);
+        assert!(
+            result["data"]["count"].as_i64().unwrap() >= 4,
+            "Expected at least 4 users"
+        );
+
+        let first_user = &result["data"]["rows"][0];
+        assert_eq!(first_user["name"], "Alice Johnson");
+        assert_eq!(first_user["email"], "alice@example.com");
+        assert_eq!(first_user["role"], "admin");
+        // Native driver supports MySQL booleans!
+        assert_eq!(first_user["active"], true);
+
+        println!("MySQL query test passed!");
+    }
+
+    #[tokio::test]
+    async fn integration_test_mysql_crud() {
+        let Some(mut bridge) = setup_mysql().await else {
+            println!("Skipping MySQL CRUD test (set INTEGRATION_TESTS=1 to run)");
+            return;
+        };
+
+        // Cleanup
+        let cleanup = json!({
+            "sql": "DELETE FROM users WHERE email = ?",
+            "params": ["testuser_mysql@integration.com"]
+        });
+        let _ = bridge.call("execute", cleanup).await;
+
+        // INSERT
+        let insert = json!({
+            "sql": "INSERT INTO users (name, email, role) VALUES (?, ?, ?)",
+            "params": ["Test User", "testuser_mysql@integration.com", "tester"]
+        });
+        let result = bridge.call("execute", insert).await.unwrap();
+        assert_eq!(result["ok"], true, "MySQL INSERT failed: {:?}", result);
+        assert_eq!(result["data"]["affected_rows"], 1);
+        // MySQL returns last_insert_id
+        assert!(result["data"]["last_insert_id"].is_number());
+
+        // SELECT with all columns
+        let query = json!({
+            "sql": "SELECT * FROM users WHERE email = ?",
+            "params": ["testuser_mysql@integration.com"]
+        });
+        let result = bridge.call("query", query).await.unwrap();
+        assert_eq!(result["ok"], true, "MySQL SELECT failed: {:?}", result);
+        assert_eq!(result["data"]["count"], 1);
+        assert_eq!(result["data"]["rows"][0]["name"], "Test User");
+
+        // UPDATE
+        let update = json!({
+            "sql": "UPDATE users SET role = ? WHERE email = ?",
+            "params": ["admin", "testuser_mysql@integration.com"]
+        });
+        let result = bridge.call("execute", update).await.unwrap();
+        assert_eq!(result["ok"], true, "MySQL UPDATE failed: {:?}", result);
+        assert_eq!(result["data"]["affected_rows"], 1);
+
+        // DELETE
+        let delete = json!({
+            "sql": "DELETE FROM users WHERE email = ?",
+            "params": ["testuser_mysql@integration.com"]
+        });
+        let result = bridge.call("execute", delete).await.unwrap();
+        assert_eq!(result["ok"], true, "MySQL DELETE failed: {:?}", result);
+        assert_eq!(result["data"]["affected_rows"], 1);
+
+        println!("MySQL CRUD test passed!");
+    }
+
+    #[tokio::test]
+    async fn integration_test_mysql_join() {
+        let Some(mut bridge) = setup_mysql().await else {
+            println!("Skipping MySQL JOIN test (set INTEGRATION_TESTS=1 to run)");
+            return;
+        };
+
+        let query = json!({
+            "sql": "SELECT p.title, u.name as author, u.active FROM posts p JOIN users u ON p.author_id = u.id WHERE u.active = true ORDER BY p.id",
+            "params": []
+        });
+
+        let result = bridge.call("query", query).await.unwrap();
+
+        assert_eq!(result["ok"], true, "MySQL JOIN failed: {:?}", result);
+        assert!(
+            result["data"]["count"].as_i64().unwrap() >= 3,
+            "Expected at least 3 posts"
+        );
+        // Verify boolean is properly returned
+        assert_eq!(result["data"]["rows"][0]["active"], true);
+
+        println!("MySQL JOIN test passed!");
     }
 
     #[tokio::test]
