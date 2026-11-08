@@ -600,9 +600,19 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
                     );
                 }
             };
+            // An unreadable or malformed where-object is an error, never "no
+            // filter": dropping it would return rows the caller excluded.
             let where_json = if where_len > 0 {
-                read_raw_string(&mut caller, where_ptr, where_len)
-                    .unwrap_or_else(|| "{}".to_string())
+                match read_raw_string(&mut caller, where_ptr, where_len) {
+                    Some(s) => s,
+                    None => {
+                        error!("_db_paginate: Failed to read where JSON");
+                        return write_string_to_caller(
+                            &mut caller,
+                            r#"{"ok":false,"err":{"code":"MEMORY_ERROR","message":"Failed to read where JSON"}}"#,
+                        );
+                    }
+                }
             } else {
                 "{}".to_string()
             };
@@ -619,8 +629,17 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
                 }
             };
 
-            let where_val: serde_json::Value =
-                serde_json::from_str(&where_json).unwrap_or(serde_json::json!({}));
+            let where_val: serde_json::Value = match serde_json::from_str(&where_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = serde_json::json!({
+                        "ok": false,
+                        "err": {"code": "VALIDATION_ERROR", "message": format!("Invalid where JSON: {}", e), "details": {}}
+                    })
+                    .to_string();
+                    return write_string_to_caller(&mut caller, &msg);
+                }
+            };
 
             let result = run_statement(
                 &mut caller,
@@ -682,9 +701,19 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
                     );
                 }
             };
+            // An unreadable or malformed where-object is an error, never "no
+            // filter": dropping it would return rows the caller excluded.
             let where_json = if where_len > 0 {
-                read_raw_string(&mut caller, where_ptr, where_len)
-                    .unwrap_or_else(|| "{}".to_string())
+                match read_raw_string(&mut caller, where_ptr, where_len) {
+                    Some(s) => s,
+                    None => {
+                        error!("_db_cursor_page: Failed to read where JSON");
+                        return write_string_to_caller(
+                            &mut caller,
+                            r#"{"ok":false,"err":{"code":"MEMORY_ERROR","message":"Failed to read where JSON"}}"#,
+                        );
+                    }
+                }
             } else {
                 "{}".to_string()
             };
@@ -715,8 +744,17 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
                 }
             };
 
-            let where_val: serde_json::Value =
-                serde_json::from_str(&where_json).unwrap_or(serde_json::json!({}));
+            let where_val: serde_json::Value = match serde_json::from_str(&where_json) {
+                Ok(v) => v,
+                Err(e) => {
+                    let msg = serde_json::json!({
+                        "ok": false,
+                        "err": {"code": "VALIDATION_ERROR", "message": format!("Invalid where JSON: {}", e), "details": {}}
+                    })
+                    .to_string();
+                    return write_string_to_caller(&mut caller, &msg);
+                }
+            };
 
             let result = run_statement(
                 &mut caller,
