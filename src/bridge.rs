@@ -6761,8 +6761,8 @@ fn register_jobs_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> 
 
 /// The locale in effect for the current call: the one selected with
 /// `_i18n_set_locale` during this request, else the one the request asks for
-/// (HOST_BRIDGE.md detection order: `?locale=` query parameter, `cl_locale`
-/// cookie, `Accept-Language` header), else the module's default locale.
+/// through the module's detection strategy (`locale: detection`, see
+/// `requested_locale`), else the module's default locale.
 fn active_locale(state: &WasmState) -> String {
     if let Some(locale) = &state.active_locale {
         return locale.clone();
@@ -6778,29 +6778,60 @@ fn active_locale(state: &WasmState) -> String {
         .unwrap_or_else(|| locale_state.default_locale.clone())
 }
 
-/// The locale a request asks for, per the server detection order. Query and
+/// The locale a request asks for. `detection = "header"` reads
+/// `Accept-Language`, `"cookie"` the `cl_locale` cookie, `"query"` the
+/// `?locale=` parameter, and `"manual"` nothing (only `locale.set` selects a
+/// locale). A module that never configured a strategy (no `locale:` block)
+/// checks the query parameter, then the cookie, then the header. Query and
 /// cookie values are taken as given; `Accept-Language` entries are matched
 /// (in preference order) against the locales whose translations are loaded.
 fn requested_locale(
     req: &crate::wasm::RequestContext,
     locale_state: &crate::locale::LocaleState,
 ) -> Option<String> {
-    if let Some(q) = req.query.get("locale").filter(|v| !v.trim().is_empty()) {
-        return Some(q.trim().to_string());
+    use crate::locale::Detection;
+    match locale_state.detection {
+        Some(Detection::Header) => header_locale(req, locale_state),
+        Some(Detection::Cookie) => cookie_locale(req),
+        Some(Detection::Query) => query_locale(req),
+        Some(Detection::Manual) => None,
+        None => query_locale(req)
+            .or_else(|| cookie_locale(req))
+            .or_else(|| header_locale(req, locale_state)),
     }
-    let header = |name: &str| {
-        req.headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            .map(|(_, v)| v.as_str())
-    };
-    if let Some(c) = header("cookie")
+}
+
+/// Value of request header `name` (case-insensitive).
+fn request_header<'a>(req: &'a crate::wasm::RequestContext, name: &str) -> Option<&'a str> {
+    req.headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+/// The `?locale=` query parameter, when not blank.
+fn query_locale(req: &crate::wasm::RequestContext) -> Option<String> {
+    req.query
+        .get("locale")
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// The `cl_locale` cookie, when not empty.
+fn cookie_locale(req: &crate::wasm::RequestContext) -> Option<String> {
+    request_header(req, "cookie")
         .and_then(|h| parse_cookies(h).remove("cl_locale"))
         .filter(|v| !v.is_empty())
-    {
-        return Some(c);
-    }
-    let accept = header("accept-language")?;
+}
+
+/// The most preferred `Accept-Language` entry whose locale (or primary
+/// language) has translations loaded.
+fn header_locale(
+    req: &crate::wasm::RequestContext,
+    locale_state: &crate::locale::LocaleState,
+) -> Option<String> {
+    let accept = request_header(req, "accept-language")?;
     let mut ranked: Vec<(f32, &str)> = accept
         .split(',')
         .filter_map(|part| {
@@ -6826,9 +6857,10 @@ fn requested_locale(
     })
 }
 
-/// Register i18n / locale bridge functions (8 functions, frame.locale contract).
+/// Register i18n / locale bridge functions (9 functions, frame.locale contract).
 ///
-/// All 7 "all-host" functions are registered plus `_i18n_load` (server-only).
+/// All 7 "all-host" functions are registered plus `_i18n_load` and
+/// `_i18n_configure` (server-only).
 /// `register_bridge_fn!` automatically creates the `i18n.*` dot-notation aliases.
 /// Additional spec-defined aliases (`t`, `tc`, `locale.*`) are added in `register_dot_aliases`.
 ///
@@ -6898,6 +6930,91 @@ fn register_locale_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()
         )
         .map_err(|e| RuntimeError::wasm(format!("Failed to define _i18n_load: {}", e)))?;
     // _i18n_load has no dot alias (internal function per spec).
+
+    // -----------------------------------------------------------------------
+    // _i18n_configure — apply a `locale:` block
+    // Signature: (default_ptr, default_len, fallback_ptr, fallback_len,
+    //             detection_ptr, detection_len, path_ptr, path_len) -> void
+    // Server-only: sets the default and fallback locales and the detection
+    // strategy, then loads every `<tag>.json` in `path` (relative to the
+    // working directory).
+    // -----------------------------------------------------------------------
+    linker
+        .func_wrap(
+            "env",
+            "_i18n_configure",
+            |mut caller: Caller<'_, WasmState>,
+             default_ptr: i32,
+             default_len: i32,
+             fallback_ptr: i32,
+             fallback_len: i32,
+             detection_ptr: i32,
+             detection_len: i32,
+             path_ptr: i32,
+             path_len: i32| {
+                let default_locale = match read_raw_string(&mut caller, default_ptr, default_len)
+                {
+                    Some(s) if !s.is_empty() => s,
+                    _ => {
+                        error!("_i18n_configure: failed to read the default locale");
+                        return;
+                    }
+                };
+                let fallback_locale =
+                    read_raw_string(&mut caller, fallback_ptr, fallback_len).unwrap_or_default();
+                let detection_text = read_raw_string(&mut caller, detection_ptr, detection_len)
+                    .unwrap_or_default();
+                let detection = match locale::Detection::parse(&detection_text) {
+                    Some(d) => d,
+                    None => {
+                        error!(
+                            "_i18n_configure: unknown detection '{}' (expected header, cookie, query or manual); using header",
+                            detection_text
+                        );
+                        locale::Detection::Header
+                    }
+                };
+                let dir = match read_raw_string(&mut caller, path_ptr, path_len) {
+                    Some(s) if !s.is_empty() => s,
+                    _ => {
+                        error!("_i18n_configure: failed to read the translations path");
+                        return;
+                    }
+                };
+                let abs_dir = std::env::current_dir().unwrap_or_default().join(&dir);
+
+                let locale_state = caller.data().locale_state.clone();
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        let mut state = locale_state.write().await;
+                        state.configure(&default_locale, &fallback_locale, detection);
+                        match state.load_dir(&abs_dir) {
+                            Ok(tags) => info!(
+                                "_i18n_configure: loaded locales [{}] from '{}' (default '{}', fallback '{}', detection {:?})",
+                                tags.join(", "),
+                                abs_dir.display(),
+                                state.default_locale,
+                                state.fallback_locale,
+                                detection
+                            ),
+                            Err(errors) => {
+                                for e in errors {
+                                    error!("{}", e);
+                                }
+                            }
+                        }
+                        if !state.translations.contains_key(&default_locale) {
+                            error!(
+                                "_i18n_configure: no translations for the default locale '{}' in '{}'",
+                                default_locale,
+                                abs_dir.display()
+                            );
+                        }
+                    })
+                });
+            },
+        )
+        .map_err(|e| RuntimeError::wasm(format!("Failed to define _i18n_configure: {}", e)))?;
 
     // -----------------------------------------------------------------------
     // _i18n_set_locale — set the active locale for the current request
@@ -7233,6 +7350,7 @@ fn register_dot_aliases(linker: &mut Linker<WasmState>) -> RuntimeResult<()> {
         ("_i18n_format_currency", "i18n.formatCurrency"),
         ("_i18n_format_date", "i18n.formatDate"),
         // locale.* aliases per registry:
+        ("_i18n_locale", "locale.current"),
         ("_i18n_locale", "locale.get"),
         ("_i18n_set_locale", "locale.set"),
         ("_i18n_format_number", "locale.formatNumber"),

@@ -6,7 +6,9 @@
 //!
 //! - Locale (frame-locale §1 `default`, §3 `locale.set`): `_i18n_set_locale`
 //!   at startup sets the module default; during a request it changes only
-//!   that request's locale.
+//!   that request's locale. `_i18n_configure` (the `locale:` block) loads
+//!   every translation file of the path and selects how requests choose
+//!   their locale (`detection = header | cookie | query | manual`).
 //! - Sessions (frame-auth AUTH-S001/S011): a session stored with
 //!   `_session_store` during a request is that request's session, and a later
 //!   request finds it through the application's configured cookie name.
@@ -26,6 +28,8 @@ const DRIVER_WAT: &str = r#"
 (module
   (import "env" "_i18n_set_locale" (func $set_locale (param i32 i32)))
   (import "env" "_i18n_locale" (func $locale (result i32)))
+  (import "env" "_i18n_configure" (func $configure (param i32 i32 i32 i32 i32 i32 i32 i32)))
+  (import "env" "_i18n_t" (func $t (param i32 i32 i32 i32) (result i32)))
   (import "env" "_session_store" (func $session_store (param i32 i32 i32 i32 i32) (result i32)))
   (import "env" "_session_get" (func $session_get (result i32)))
   (import "env" "_mcp_http_serve" (func $mcp_serve (param i32 i32 i32) (result i32)))
@@ -48,6 +52,11 @@ const DRIVER_WAT: &str = r#"
 
   (func (export "set_locale") (param i32 i32) (call $set_locale (local.get 0) (local.get 1)))
   (func (export "locale") (result i32) (call $locale))
+  (func (export "configure") (param i32 i32 i32 i32 i32 i32 i32 i32)
+    (call $configure (local.get 0) (local.get 1) (local.get 2) (local.get 3)
+                     (local.get 4) (local.get 5) (local.get 6) (local.get 7)))
+  (func (export "t") (param i32 i32 i32 i32) (result i32)
+    (call $t (local.get 0) (local.get 1) (local.get 2) (local.get 3)))
   ;; session_store(sid_lp, key_lp, value_lp) — Clean length-prefixed pointers
   (func (export "session_store") (param i32 i32 i32) (result i32)
     (call $session_store (local.get 0) (local.get 1) (local.get 2) (i32.const 0) (i32.const 0)))
@@ -129,6 +138,35 @@ impl Driver {
         let p = self.call0("locale");
         self.read(p)
     }
+
+    /// `_i18n_configure(default, fallback, detection, path)`.
+    fn configure(&mut self, default: &str, fallback: &str, detection: &str, path: &str) {
+        let (_, d, dl) = self.put(default);
+        let (_, f, fl) = self.put(fallback);
+        let (_, m, ml) = self.put(detection);
+        let (_, p, pl) = self.put(path);
+        let func = self
+            .instance
+            .get_typed_func::<(i32, i32, i32, i32, i32, i32, i32, i32), ()>(
+                &mut self.store,
+                "configure",
+            )
+            .unwrap();
+        func.call(&mut self.store, (d, dl, f, fl, m, ml, p, pl))
+            .unwrap();
+    }
+
+    /// `t(key, "{}")`.
+    fn t(&mut self, key: &str) -> String {
+        let (_, k, kl) = self.put(key);
+        let (_, p, pl) = self.put("{}");
+        let func = self
+            .instance
+            .get_typed_func::<(i32, i32, i32, i32), i32>(&mut self.store, "t")
+            .unwrap();
+        let ptr = func.call(&mut self.store, (k, kl, p, pl)).unwrap();
+        self.read(ptr)
+    }
 }
 
 fn request(headers: &[(&str, &str)], query: &[(&str, &str)]) -> RequestContext {
@@ -193,6 +231,120 @@ async fn locale_default_from_startup_and_per_request_set() {
     assert_eq!(by_query.locale(), "es");
     let mut by_cookie = fresh_request(&[("Cookie", "cl_locale=it")], &[]);
     assert_eq!(by_cookie.locale(), "it");
+}
+
+/// A translations folder with en, fr, de and es files.
+fn translations_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let files = [
+        ("en", r#"{"hello": "Hello", "bye": "Goodbye"}"#),
+        (
+            "fr",
+            r#"{"hello": "Bonjour", "bye": "Au revoir", "only_fr": "Seulement"}"#,
+        ),
+        ("de", r#"{"hello": "Hallo"}"#),
+        ("es", r#"{"hello": "Hola"}"#),
+    ];
+    for (tag, json) in files {
+        std::fs::write(dir.path().join(format!("{tag}.json")), json).unwrap();
+    }
+    // Not a translation file: ignored.
+    std::fs::write(dir.path().join("README.txt"), "not json").unwrap();
+    dir
+}
+
+/// Request headers / query parameters as `(name, value)` pairs.
+type Pairs<'a> = &'a [(&'a str, &'a str)];
+
+/// Configure the `locale:` block at startup and return a request factory
+/// sharing that module state.
+fn configured_module(
+    engine: &Engine,
+    module: &Module,
+    detection: &str,
+    dir: &std::path::Path,
+) -> impl Fn(Pairs, Pairs) -> Driver {
+    let router = Arc::new(Router::new());
+    let mut init_state = WasmState::new(router.clone());
+    init_state.initializing = true;
+    let locale_state = init_state.locale_state.clone();
+    let mut init = Driver::new(engine, module, init_state);
+    init.configure("en", "fr", detection, dir.to_str().unwrap());
+    let engine = engine.clone();
+    let module = module.clone();
+    move |headers: Pairs, query: Pairs| {
+        let mut state = WasmState::new(router.clone());
+        state.locale_state = locale_state.clone();
+        state.set_request(request(headers, query));
+        Driver::new(&engine, &module, state)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_loads_every_translation_file_and_detects_from_header() {
+    let (engine, module) = setup();
+    let dir = translations_dir();
+    let fresh = configured_module(&engine, &module, "header", dir.path());
+
+    // Without a preference the request gets the default locale.
+    let mut plain = fresh(&[], &[]);
+    assert_eq!(plain.locale(), "en");
+    assert_eq!(plain.t("hello"), "Hello");
+
+    // de and es are neither the default nor the fallback, yet their files
+    // were loaded from the translations path.
+    let mut german = fresh(&[("Accept-Language", "de-DE,de;q=0.9,en;q=0.5")], &[]);
+    assert_eq!(german.locale(), "de");
+    assert_eq!(german.t("hello"), "Hallo");
+    // A key missing from de comes from the default, then the fallback.
+    assert_eq!(german.t("bye"), "Goodbye");
+    assert_eq!(german.t("only_fr"), "Seulement");
+    let mut spanish = fresh(&[("accept-language", "es")], &[]);
+    assert_eq!(spanish.t("hello"), "Hola");
+
+    // detection = "header": the query parameter and the cookie are ignored.
+    let mut other = fresh(&[("Cookie", "cl_locale=fr")], &[("locale", "es")]);
+    assert_eq!(other.locale(), "en");
+    // An Accept-Language with no loaded locale falls back to the default.
+    let mut unknown = fresh(&[("Accept-Language", "ja")], &[]);
+    assert_eq!(unknown.locale(), "en");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configure_detection_cookie_query_and_manual() {
+    let (engine, module) = setup();
+    let dir = translations_dir();
+    let all = [
+        ("Cookie", "theme=dark; cl_locale=fr"),
+        ("Accept-Language", "de"),
+    ];
+    let query = [("locale", "es")];
+
+    let by_cookie = configured_module(&engine, &module, "cookie", dir.path());
+    let mut req = by_cookie(&all, &query);
+    assert_eq!(
+        req.locale(),
+        "fr",
+        "detection = cookie reads cl_locale only"
+    );
+    assert_eq!(req.t("hello"), "Bonjour");
+    assert_eq!(
+        by_cookie(&[("Accept-Language", "de")], &query).locale(),
+        "en"
+    );
+
+    let by_query = configured_module(&engine, &module, "query", dir.path());
+    let mut req = by_query(&all, &query);
+    assert_eq!(req.locale(), "es", "detection = query reads ?locale= only");
+    assert_eq!(req.t("hello"), "Hola");
+    assert_eq!(by_query(&all, &[]).locale(), "en");
+
+    let manual = configured_module(&engine, &module, "manual", dir.path());
+    let mut req = manual(&all, &query);
+    assert_eq!(req.locale(), "en", "detection = manual ignores the request");
+    req.set_locale("de");
+    assert_eq!(req.locale(), "de", "locale.set still selects the locale");
+    assert_eq!(req.t("hello"), "Hallo");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
