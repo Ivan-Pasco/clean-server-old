@@ -150,6 +150,57 @@ jobs:
         run: cargo test --test ${{ matrix.test }}
 
   # ---------------------------------------------------------------
+  # T2 · MySQL 8 — frame.data's SQL translated for MySQL (host-bridge
+  # src/mysql_sql.rs) against a real server. The tests in
+  # `db::mysql_dialect_tests` skip themselves unless CLEAN_TEST_MYSQL_URL
+  # is set, so they run here only.
+  # ---------------------------------------------------------------
+  mysql:
+    name: T2 · MySQL 8 (frame.data dialect)
+    runs-on: ubuntu-latest
+    needs: policy
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: cleantest
+          MYSQL_DATABASE: clean_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pcleantest"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+    env:
+      CLEAN_TEST_MYSQL_URL: mysql://root:cleantest@127.0.0.1:3306/clean_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-mysql-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-unit-
+
+      - name: MySQL dialect translation + integration tests
+        run: cd host-bridge && cargo test --lib mysql_ -- --nocapture
+
+  # ---------------------------------------------------------------
   # T2 · Integration tests that read files from monorepo siblings.
   #
   #   bridge_contract_test / bridge_compliance_test
