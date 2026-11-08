@@ -242,13 +242,10 @@ fn bridge_covers_registry() {
     );
 }
 
-/// The server registers no-op stubs for browser-hosted frame.client `_api_*`
-/// bridges so modules that also contain client code (form:/send: blocks)
-/// instantiate on the server. Those stubs must match the compiler-emitted
-/// import exactly, which follows the PluginBridge convention (`integer` →
-/// `i32`) for every registry entry with `browser` in `hosts`.
-#[test]
-fn api_stubs_match_registry_signatures() {
+/// Probe every registry entry whose name starts with `prefix` against the
+/// server linker, using the convention the compiler emits for it, and return
+/// the entries that fail to link.
+fn stub_signature_mismatches(prefix: &str) -> Vec<String> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let registry_path = manifest_dir.join("../foundation/spec/platform/function-registry.toml");
     let toml_str =
@@ -259,18 +256,19 @@ fn api_stubs_match_registry_signatures() {
     let engine = Engine::default();
     let linker = create_linker(&engine).expect("Failed to create server linker");
 
-    let api_funcs: Vec<&FunctionEntry> = registry
+    let funcs: Vec<&FunctionEntry> = registry
         .functions
         .iter()
-        .filter(|f| f.name.starts_with("_api_"))
+        .filter(|f| f.name.starts_with(prefix))
         .collect();
     assert!(
-        !api_funcs.is_empty(),
-        "registry must declare the frame.client _api_* bridges"
+        !funcs.is_empty(),
+        "registry must declare the frame.client {}* bridges",
+        prefix
     );
 
     let mut mismatched: Vec<String> = Vec::new();
-    for func in api_funcs {
+    for func in funcs {
         let conv = convention_for(&func.hosts);
         let wat = single_import_wat(&func.module, &func.name, &func.params, &func.returns, conv);
         let module = Module::new(&engine, &wat).expect("generated WAT must be valid");
@@ -279,10 +277,37 @@ fn api_stubs_match_registry_signatures() {
             mismatched.push(format!("{}::{} — {}", func.module, func.name, e));
         }
     }
+    mismatched
+}
 
+/// The server registers no-op stubs for browser-hosted frame.client `_api_*`
+/// bridges so modules that also contain client code (form:/send: blocks)
+/// instantiate on the server. Those stubs must match the compiler-emitted
+/// import exactly, which follows the PluginBridge convention (`integer` →
+/// `i32`) for every registry entry with `browser` in `hosts`.
+#[test]
+fn api_stubs_match_registry_signatures() {
+    let mismatched = stub_signature_mismatches("_api_");
     assert!(
         mismatched.is_empty(),
         "{} _api_* stub(s) do not match function-registry.toml:\n{}",
+        mismatched.len(),
+        mismatched.join("\n")
+    );
+}
+
+/// The frame.client `live.*` (WebSocket) and `feed.*` (SSE) bridges are
+/// browser-hosted plugin bridges too: the compiler emits `integer` as `i32`
+/// for them (`live.send(connId, msg)` imports `(i32, i32, i32) -> i32`), so
+/// the server stubs must use the same convention or a module that contains a
+/// `live.*` / `feed.*` call fails to instantiate on the server.
+#[test]
+fn live_and_feed_stubs_match_registry_signatures() {
+    let mut mismatched = stub_signature_mismatches("_live_");
+    mismatched.extend(stub_signature_mismatches("_feed_"));
+    assert!(
+        mismatched.is_empty(),
+        "{} _live_*/_feed_* stub(s) do not match function-registry.toml:\n{}",
         mismatched.len(),
         mismatched.join("\n")
     );

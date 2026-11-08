@@ -8,6 +8,7 @@ browser-only Layer 2 functions are added.
 
 Usage:
     python3 tools/gen_browser_stubs.py > src/bridge_browser_stubs.rs
+    cargo fmt
 
 The list of names to stub is intentionally hard-coded here so that:
 1. The script is deterministic (does not silently expand its scope).
@@ -22,7 +23,19 @@ import sys
 import tomllib
 from pathlib import Path
 
-REGISTRY = Path("/Users/earcandy/Documents/Dev/Clean Language/foundation/platform-architecture/function-registry.toml")
+# <repo>/tools/gen_browser_stubs.py -> <repo>/../foundation/spec/platform
+REGISTRY = (
+    Path(__file__).resolve().parents[1].parent
+    / "foundation/spec/platform/function-registry.toml"
+)
+
+# Categories whose functions are plugin bridges (declared in a plugin's
+# [bridge] section: frame.client api/feed/live, frame.ui ui). The compiler
+# emits plugin bridges with the PluginBridge convention, where "integer" is a
+# WASM i32 — the server stubs must use the same width or the module fails to
+# instantiate with "incompatible import type". Every other category is a
+# HostBridge function, where "integer" is an i64.
+PLUGIN_BRIDGE_CATEGORIES = {"api", "feed", "live", "ui"}
 
 MISSING = sorted([
     "_alloc_string",
@@ -45,13 +58,17 @@ MISSING = sorted([
     "_ui_set_timeout","_ui_toast","_ui_toast_dismiss","_ui_toast_dismiss_all",
 ])
 
-def expand_param(t):
-    return {"string": ["i32","i32"], "integer": ["i64"], "number": ["f64"],
+def integer_width(category):
+    return "i32" if category in PLUGIN_BRIDGE_CATEGORIES else "i64"
+
+def expand_param(t, category):
+    return {"string": ["i32","i32"], "integer": [integer_width(category)], "number": ["f64"],
             "boolean": ["i32"], "i32": ["i32"], "i64": ["i64"]}[t]
 
-def expand_return(t):
+def expand_return(t, category):
     return {"void": None, "ptr": "i32", "string": "i32", "i32": "i32",
-            "i64": "i64", "boolean": "i32", "integer": "i64", "number": "f64"}.get(t)
+            "i64": "i64", "boolean": "i32", "integer": integer_width(category),
+            "number": "f64"}.get(t)
 
 def main():
     reg = tomllib.loads(REGISTRY.read_text())
@@ -76,7 +93,7 @@ def main():
 //! server are expected to receive sentinel values and degrade gracefully.
 //!
 //! AUTO-GENERATED via tools/gen_browser_stubs.py from
-//! foundation/platform-architecture/function-registry.toml. Re-run when
+//! foundation/spec/platform/function-registry.toml. Re-run when
 //! new browser-only Layer 2 functions are added to the registry.
 
 use crate::error::{RuntimeError, RuntimeResult};
@@ -97,8 +114,8 @@ pub fn register_browser_stubs(linker: &mut Linker<WasmState>) -> RuntimeResult<(
         out.write(f"\n\n    // ===== category: {cat} ({len(groups[cat])} fns) =====\n")
         for fn in groups[cat]:
             name = fn["name"]
-            wasm_params = [w for p in fn["params"] for w in expand_param(p)]
-            wasm_ret = expand_return(fn["returns"])
+            wasm_params = [w for p in fn["params"] for w in expand_param(p, cat)]
+            wasm_ret = expand_return(fn["returns"], cat)
             ret = fn["returns"]
             needs_mut = wasm_ret == "i32" and ret in ("string", "ptr")
             caller_arg = "mut caller: Caller<'_, WasmState>" if needs_mut else "_caller: Caller<'_, WasmState>"
