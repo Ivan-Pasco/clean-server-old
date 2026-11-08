@@ -168,7 +168,7 @@ and `register_bridge_fn!` on the current source; treat as rough):
 | `_role_*` / `_roles_*` | 3 | Role registration, permission lookup |
 | `_json_*` | 3 | Host-side JSON parse/encode (bypasses WASM memory) |
 | `_test_*` | 3 | In-process HTTP request helpers for tests |
-| `_async_*` | 2 | `_async_fire`, `_async_await` |
+| `_async_*` | 2 | `_async_fire_slot`, `_async_await_slot` |
 | `_schedule_*` | 2 | Cron register / cancel |
 | Singletons | 6 | `_dev_snapshot`, `_island_register`, `_jwt_refresh_and_rotate`, `_cors_configure`, `_rate_limit_configure`, `_server_sleep` |
 

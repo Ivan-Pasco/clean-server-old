@@ -50,6 +50,7 @@ TIER2_FILES=(
   schedule_cron_bridge_test.rs
   request_state_bridge_test.rs
   db_transaction_bridge_test.rs
+  async_task_bridge_test.rs
 )
 
 TIER3_FILES=(

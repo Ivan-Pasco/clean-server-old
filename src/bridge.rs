@@ -4943,40 +4943,45 @@ fn process_show_directive(html: &str, data: &serde_json::Value) -> String {
     result
 }
 
-/// Register async bridge functions (_async_fire, _async_await, _server_sleep)
+/// Register async bridge functions (_async_fire_slot, _async_await_slot, _server_sleep)
 fn register_async_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> {
-    // _async_fire — fire-and-forget: lower `background expr`
-    // Signature: (fn_name_ptr: i32, fn_name_len: i32, args_ptr: i32, args_len: i32) -> void
+    // _async_fire_slot — `background f(...)` / `later x = f(...)`: hand over
+    // the task at `slot` of `__indirect_function_table` with its environment
+    // block. It runs after the entry point that started it has returned
+    // (`crate::wasm::run_async_tasks`, HOST_BRIDGE.md §Async).
+    // Signature: (slot: i32, env: i32) -> void
     register_bridge_fn!(
         linker,
-        "_async_fire",
-        |mut caller: Caller<'_, WasmState>,
-         fn_name_ptr: i32,
-         fn_name_len: i32,
-         _args_ptr: i32,
-         _args_len: i32| {
-            let fn_name = read_raw_string(&mut caller, fn_name_ptr, fn_name_len)
-                .unwrap_or_else(|| "<unknown>".to_string());
-            debug!("_async_fire: scheduling background call to '{}'", fn_name);
+        "_async_fire_slot",
+        |mut caller: Caller<'_, WasmState>, slot: i32, env: i32| {
+            caller.data_mut().async_tasks.push_back((slot, env));
         }
     );
 
-    // _async_await — blocking async: lower `later x = expr`
-    // Signature: (fn_name_ptr: i32, fn_name_len: i32, args_ptr: i32, args_len: i32) -> i32 (ptr)
-    register_bridge_fn!(linker, "_async_await", |mut caller: Caller<
+    // _async_await_slot — reading a `later` variable: run the task now (a
+    // task that already ran returns its stored result) and return the
+    // address of its result cell.
+    // Signature: (slot: i32, env: i32) -> i32
+    register_bridge_fn!(linker, "_async_await_slot", |mut caller: Caller<
         '_,
         WasmState,
     >,
-                                                 fn_name_ptr: i32,
-                                                 fn_name_len: i32,
-                                                 _args_ptr: i32,
-                                                 _args_len: i32|
-     -> i32 {
-        let fn_name = read_raw_string(&mut caller, fn_name_ptr, fn_name_len)
-            .unwrap_or_else(|| "<unknown>".to_string());
-        debug!("_async_await: blocking call to '{}'", fn_name);
-        // Write an empty string result into WASM memory and return its pointer
-        write_string_to_caller(&mut caller, "")
+                                                      slot: i32,
+                                                      env: i32|
+     -> wasmtime::Result<i32> {
+        let table = caller
+            .get_export("__indirect_function_table")
+            .and_then(|e| e.into_table())
+            .ok_or_else(|| wasmtime::Error::msg("module exports no __indirect_function_table"))?;
+        let task = u64::try_from(slot)
+            .ok()
+            .and_then(|index| table.get(&mut caller, index))
+            .and_then(|entry| entry.as_func().flatten().copied())
+            .ok_or_else(|| {
+                wasmtime::Error::msg(format!("async task slot {} holds no function", slot))
+            })?
+            .typed::<i32, i32>(&caller)?;
+        task.call(&mut caller, env)
     });
 
     // _server_sleep — suspend for N milliseconds
