@@ -1,24 +1,34 @@
 //! UI Bridge Stub Coverage Test
 //!
-//! Verifies that the server linker registers stubs for every frame.ui bridge
-//! function declared with `server_impl = "stub"` in
-//! `clean-framework/plugins/frame.ui/plugin.toml`, plus browser-only functions
-//! that the `events:` DSL may emit into server-mode WASM.
+//! Verifies that the server linker registers a working stub for every
+//! browser-side frame.ui bridge function, so that WASM modules compiled with
+//! `component: client="on"` / `events:` blocks link and run on the server.
 //!
-//! Without these stubs, any WASM module compiled with a `component: client="on"`
-//! block fails `Linker::instantiate` with
-//! `unknown import: env::_ui_on_event`. This test catches missing stubs before
-//! they cause production `LinkError`s.
+//! Without these stubs, any WASM module compiled with a client-hydration
+//! component fails `Linker::instantiate` with
+//! `unknown import: env::_ui_on_event`. This test catches missing stubs, wrong
+//! signatures and trapping stubs before they cause production failures.
+//!
+//! # Source of truth
+//!
+//! The set of browser-side UI bridges comes from the function registry
+//! (`foundation/spec/platform/function-registry.toml`): every entry in the
+//! frame.ui categories (`ui`, `ui_browser`, `storage`) whose `hosts` field
+//! includes `"browser"`. That covers both the SSR-stubbed entries
+//! (`hosts = ["browser", "server"]`) and the browser-only entries
+//! (`hosts = ["browser"]`) that the `events:` DSL may still emit into
+//! server-mode WASM (`_ui_navigate`, `_ui_shortcut_*`, ...).
 //!
 //! # How It Works
 //!
-//! 1. Parses `clean-framework/plugins/frame.ui/plugin.toml` `[bridge]` section.
-//! 2. Collects every entry that has `server_impl = "stub"` (browser-side
-//!    functions that need no-op stubs on the server).
-//! 3. Also includes browser-only functions that the `events:` DSL may emit.
-//! 4. Generates a synthetic WAT module importing every function.
-//! 5. Instantiates it against the full server linker.
-//! 6. Fails with the precise missing import if any stub is absent.
+//! 1. Reads the registry and selects the browser-side UI entries.
+//! 2. Generates one synthetic WAT module importing every function (with the
+//!    plugin-bridge type convention, `integer` → `i32`, which is what the
+//!    compiler emits for browser-hosted bridges) plus one exported probe per
+//!    import that calls it with zero arguments.
+//! 3. Instantiates it against the full server linker — fails with the precise
+//!    missing import if any stub is absent or has the wrong signature.
+//! 4. Calls every probe — fails listing every stub that traps.
 
 use clean_server::bridge::create_linker;
 use clean_server::router::Router;
@@ -27,185 +37,132 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use wasmtime::{Engine, Module, Store};
 
-fn locate_ui_plugin_toml() -> PathBuf {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let mut cur = manifest_dir.as_path();
-    loop {
-        let candidate = cur.join("clean-framework/plugins/frame.ui/plugin.toml");
-        if candidate.exists() {
-            return candidate;
-        }
-        match cur.parent() {
-            Some(p) => cur = p,
-            None => panic!(
-                "Could not locate clean-framework/plugins/frame.ui/plugin.toml \
-                 starting from {}",
-                manifest_dir.display()
-            ),
-        }
-    }
+/// Registry categories that make up the frame.ui bridge surface.
+const UI_CATEGORIES: &[&str] = &["ui", "ui_browser", "storage"];
+
+#[derive(serde::Deserialize)]
+struct Registry {
+    functions: Vec<FunctionEntry>,
 }
 
-struct BridgeEntry {
+#[derive(serde::Deserialize)]
+struct FunctionEntry {
     name: String,
+    category: String,
+    module: String,
     params: Vec<String>,
     returns: String,
+    #[serde(default)]
+    hosts: Vec<String>,
 }
 
-fn extract_quoted(line: &str, key: &str) -> Option<String> {
-    let needle = format!("{} = \"", key);
-    let start = line.find(&needle)? + needle.len();
-    let end_rel = line[start..].find('"')?;
-    Some(line[start..start + end_rel].to_string())
-}
-
-fn extract_array(line: &str, key: &str) -> Vec<String> {
-    let needle = format!("{} = [", key);
-    let Some(start) = line.find(&needle) else {
-        return Vec::new();
-    };
-    let start = start + needle.len();
-    let Some(end_rel) = line[start..].find(']') else {
-        return Vec::new();
-    };
-    let inner = &line[start..start + end_rel];
-    inner
-        .split(',')
-        .map(|s| s.trim().trim_matches('"').to_string())
-        .filter(|s| !s.is_empty())
+fn load_browser_ui_entries() -> Vec<FunctionEntry> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let registry_path = manifest_dir.join("../foundation/spec/platform/function-registry.toml");
+    let text = std::fs::read_to_string(&registry_path)
+        .unwrap_or_else(|e| panic!("Failed to read {}: {}", registry_path.display(), e));
+    let registry: Registry = toml::from_str(&text).expect("Failed to parse function-registry.toml");
+    registry
+        .functions
+        .into_iter()
+        .filter(|f| {
+            UI_CATEGORIES.contains(&f.category.as_str()) && f.hosts.iter().any(|h| h == "browser")
+        })
         .collect()
 }
 
-/// Parse bridge entries with `server_impl = "stub"` from plugin.toml.
-fn parse_stub_entries(text: &str) -> Vec<BridgeEntry> {
-    let bridge_start = text
-        .find("[bridge]")
-        .expect("frame.ui plugin.toml missing [bridge] section");
-    let rest = &text[bridge_start + "[bridge]".len()..];
-    let bridge_end = rest
-        .find("\n[")
-        .map(|i| bridge_start + "[bridge]".len() + i)
-        .unwrap_or(text.len());
-    let block = &text[bridge_start..bridge_end];
-
-    let mut entries = Vec::new();
-    for line in block.lines() {
-        let trimmed = line.trim_start();
-        if !trimmed.starts_with('{') {
-            continue;
-        }
-        // Only include entries that have server_impl = "stub"
-        if !trimmed.contains("server_impl = \"stub\"") {
-            continue;
-        }
-        let Some(name) = extract_quoted(trimmed, "name") else {
-            continue;
-        };
-        let params = extract_array(trimmed, "params");
-        let returns = extract_quoted(trimmed, "returns").unwrap_or_default();
-        entries.push(BridgeEntry {
-            name,
-            params,
-            returns,
-        });
-    }
-    entries
-}
-
+/// Browser-hosted bridges follow the plugin-bridge convention: `integer` is
+/// an `i32` (see `bridge_contract_test.rs::TypeConvention`).
 fn expand_param_type(t: &str) -> Vec<&'static str> {
     match t {
         "string" => vec!["i32", "i32"],
-        "integer" => vec!["i32"],
+        "integer" | "boolean" | "i32" | "ptr" | "any" => vec!["i32"],
+        "i64" => vec!["i64"],
         "number" => vec!["f64"],
-        "boolean" => vec!["i32"],
-        "ptr" => vec!["i32"],
-        other => panic!("Unknown param type in frame.ui/plugin.toml: '{}'", other),
+        other => panic!("Unknown param type in function-registry.toml: '{}'", other),
     }
 }
 
 fn expand_return_type(t: &str) -> Option<&'static str> {
     match t {
         "" | "void" => None,
-        "string" => Some("i32"),
-        "ptr" => Some("i32"),
-        "integer" => Some("i32"),
+        "string" | "ptr" | "integer" | "boolean" | "i32" | "any" => Some("i32"),
+        "i64" => Some("i64"),
         "number" => Some("f64"),
-        "boolean" => Some("i32"),
-        other => panic!("Unknown return type in frame.ui/plugin.toml: '{}'", other),
+        other => panic!("Unknown return type in function-registry.toml: '{}'", other),
     }
 }
 
-fn generate_wat_import(entry: &BridgeEntry) -> String {
-    let mut import = format!("  (import \"env\" \"{}\" (func", entry.name);
-    let params: Vec<&str> = entry
-        .params
-        .iter()
-        .flat_map(|t| expand_param_type(t))
-        .collect();
-    if !params.is_empty() {
-        import.push_str(" (param");
-        for p in &params {
-            import.push_str(&format!(" {}", p));
+fn zero_const(wasm_type: &str) -> String {
+    format!("({}.const 0)", wasm_type)
+}
+
+/// Builds a module that imports every entry and exports `probe_<i>` calling
+/// import `i` with zero arguments. It also exports `memory`, `malloc` and
+/// `__heap_ptr` so string-returning stubs can write their (empty) result the
+/// same way they do for compiler-generated modules.
+fn generate_probe_module(entries: &[FunctionEntry]) -> String {
+    let mut wat = String::from("(module\n");
+    for (i, entry) in entries.iter().enumerate() {
+        let params: Vec<&str> = entry
+            .params
+            .iter()
+            .flat_map(|t| expand_param_type(t))
+            .collect();
+        let result = expand_return_type(&entry.returns);
+        wat.push_str(&format!(
+            "  (import \"{}\" \"{}\" (func $f{}",
+            entry.module, entry.name, i
+        ));
+        if !params.is_empty() {
+            wat.push_str(&format!(" (param {})", params.join(" ")));
         }
-        import.push(')');
+        if let Some(r) = result {
+            wat.push_str(&format!(" (result {})", r));
+        }
+        wat.push_str("))\n");
     }
-    if let Some(r) = expand_return_type(&entry.returns) {
-        import.push_str(&format!(" (result {})", r));
+    wat.push_str("  (memory (export \"memory\") 1)\n");
+    wat.push_str("  (global $heap (export \"__heap_ptr\") (mut i32) (i32.const 1024))\n");
+    wat.push_str(
+        "  (func (export \"malloc\") (param $n i32) (result i32)\n\
+         \x20   (local $p i32)\n\
+         \x20   (local.set $p (global.get $heap))\n\
+         \x20   (global.set $heap (i32.add (global.get $heap) (local.get $n)))\n\
+         \x20   (local.get $p))\n",
+    );
+    for (i, entry) in entries.iter().enumerate() {
+        let args: Vec<String> = entry
+            .params
+            .iter()
+            .flat_map(|t| expand_param_type(t))
+            .map(zero_const)
+            .collect();
+        let call = format!("(call $f{} {})", i, args.join(" "));
+        let body = if expand_return_type(&entry.returns).is_some() {
+            format!("(drop {})", call)
+        } else {
+            call
+        };
+        wat.push_str(&format!("  (func (export \"probe_{}\") {})\n", i, body));
     }
-    import.push_str("))");
-    import
-}
-
-/// Extra browser-only functions the `events:` DSL may emit into server WASM.
-/// These are not declared with `server_impl = "stub"` but still need stubs.
-fn extra_browser_only_entries() -> Vec<BridgeEntry> {
-    vec![
-        BridgeEntry {
-            name: "_ui_shortcut_register".into(),
-            params: vec!["string".into(), "string".into(), "string".into()],
-            returns: "integer".into(),
-        },
-        BridgeEntry {
-            name: "_ui_shortcut_remove".into(),
-            params: vec!["integer".into()],
-            returns: "void".into(),
-        },
-        BridgeEntry {
-            name: "_ui_shortcut_clear".into(),
-            params: vec![],
-            returns: "void".into(),
-        },
-        BridgeEntry {
-            name: "_ui_navigate".into(),
-            params: vec!["string".into()],
-            returns: "void".into(),
-        },
-    ]
+    wat.push(')');
+    wat
 }
 
 #[test]
 fn ui_stubs_cover_browser_side_bridge() {
-    let plugin_toml = locate_ui_plugin_toml();
-    let text = std::fs::read_to_string(&plugin_toml)
-        .unwrap_or_else(|e| panic!("Failed to read {}: {}", plugin_toml.display(), e));
-
-    let mut entries = parse_stub_entries(&text);
+    let entries = load_browser_ui_entries();
     assert!(
         entries.len() >= 50,
-        "Expected at least 50 stub entries in frame.ui/plugin.toml — found {}. \
-         If plugin.toml changed, review parse_stub_entries().",
+        "Expected at least 50 browser-side UI bridge entries in function-registry.toml \
+         (categories {:?}, hosts containing \"browser\") — found {}. \
+         If the registry changed, review load_browser_ui_entries().",
+        UI_CATEGORIES,
         entries.len()
     );
 
-    entries.extend(extra_browser_only_entries());
-
-    let mut wat = String::from("(module\n");
-    for entry in &entries {
-        wat.push_str(&generate_wat_import(entry));
-        wat.push('\n');
-    }
-    wat.push(')');
-
+    let wat = generate_probe_module(&entries);
     let engine = Engine::default();
     let module = Module::new(&engine, &wat).unwrap_or_else(|e| {
         panic!(
@@ -221,15 +178,29 @@ fn ui_stubs_cover_browser_side_bridge() {
     let state = WasmState::new(router);
     let mut store = Store::new(&engine, state);
 
-    let result = linker.instantiate(&mut store, &module);
-    match result {
-        Ok(_) => {}
-        Err(e) => panic!(
+    let instance = linker.instantiate(&mut store, &module).unwrap_or_else(|e| {
+        panic!(
             "Failed to instantiate UI WAT module with {} imports: {}\n\
              A browser-side `_ui_*` or `_storage_*` host stub is missing or \
              has the wrong signature. Add it to src/bridge_ui_stubs.rs.",
             entries.len(),
             e
-        ),
+        )
+    });
+
+    let mut trapped: Vec<String> = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let probe = instance
+            .get_typed_func::<(), ()>(&mut store, &format!("probe_{}", i))
+            .expect("probe export must exist");
+        if let Err(e) = probe.call(&mut store, ()) {
+            trapped.push(format!("{} — {}", entry.name, e));
+        }
     }
+    assert!(
+        trapped.is_empty(),
+        "{} browser-side UI stub(s) trapped when called on the server:\n{}",
+        trapped.len(),
+        trapped.join("\n")
+    );
 }

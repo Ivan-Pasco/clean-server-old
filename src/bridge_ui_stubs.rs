@@ -9,11 +9,12 @@
 //! `unknown import: env::_ui_on_event` whenever the server loads a `.wasm` that
 //! has any client-hydration component in it.
 //!
-//! This file registers a no-op for every browser-side bridge entry declared in
-//! `clean-framework/plugins/frame.ui/plugin.toml [bridge]` with
-//! `server_impl = "stub"`, plus browser-only functions that the `events:` DSL
-//! may emit into server-mode WASM. None of these stubs perform any work —
-//! browser interactions are not executed server-side.
+//! This file registers a no-op for every frame.ui bridge entry that the
+//! function registry (`foundation/spec/platform/function-registry.toml`)
+//! scopes to `hosts = ["browser", "server"]`, plus browser-only functions
+//! that the `events:` DSL may emit into server-mode WASM. None of these stubs
+//! perform any work — browser interactions are not executed server-side.
+//! `tests/ui_stubs_test.rs` checks the set against the registry.
 //!
 //! Server-side UI functions (`_ui_render_page`, `_ui_load_layout`, etc.) are
 //! already registered with real implementations in `bridge.rs::register_ui_functions`.

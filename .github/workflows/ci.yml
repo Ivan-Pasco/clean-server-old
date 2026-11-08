@@ -152,14 +152,15 @@ jobs:
   # ---------------------------------------------------------------
   # T2 · Integration tests that read files from monorepo siblings.
   #
-  #   bridge_contract_test / bridge_compliance_test  → ../foundation/…
-  #   canvas_stubs_test  / ui_stubs_test            → walk to
+  #   bridge_contract_test / bridge_compliance_test
+  #   / ui_stubs_test                               → ../foundation/…
+  #   canvas_stubs_test                             → walk to
   #                                                    clean-framework/plugins/…
   #
   # We stage siblings inside GITHUB_WORKSPACE to match the local layout:
   #   $GITHUB_WORKSPACE/clean-server/    (this repo)
   #   $GITHUB_WORKSPACE/foundation/      (function-registry.toml)
-  #   $GITHUB_WORKSPACE/clean-framework/ (frame.canvas + frame.ui plugin.toml)
+  #   $GITHUB_WORKSPACE/clean-framework/ (frame.canvas plugin.toml)
   # ---------------------------------------------------------------
   integration-monorepo:
     name: T2 · Integration (monorepo-only)
@@ -199,12 +200,11 @@ jobs:
           path: clean-framework
           sparse-checkout: |
             plugins/frame.canvas/plugin.toml
-            plugins/frame.ui/plugin.toml
 
-      - name: Skip canvas/ui when clean-framework repo is not accessible
+      - name: Skip canvas when clean-framework repo is not accessible
         if: |
           steps.framework.outcome != 'success' &&
-          (matrix.test == 'canvas_stubs_test' || matrix.test == 'ui_stubs_test')
+          matrix.test == 'canvas_stubs_test'
         run: |
           echo "::warning::clean-framework repo not accessible (private or unpublished). \
                 Skipping ${{ matrix.test }} in CI — pre-push hook still runs it locally. \
@@ -214,13 +214,13 @@ jobs:
       - name: Install Rust
         if: |
           steps.framework.outcome == 'success' ||
-          (matrix.test != 'canvas_stubs_test' && matrix.test != 'ui_stubs_test')
+          matrix.test != 'canvas_stubs_test'
         uses: dtolnay/rust-toolchain@stable
 
       - name: System deps
         if: |
           steps.framework.outcome == 'success' ||
-          (matrix.test != 'canvas_stubs_test' && matrix.test != 'ui_stubs_test')
+          matrix.test != 'canvas_stubs_test'
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libssl-dev
@@ -228,7 +228,7 @@ jobs:
       - name: Cargo cache
         if: |
           steps.framework.outcome == 'success' ||
-          (matrix.test != 'canvas_stubs_test' && matrix.test != 'ui_stubs_test')
+          matrix.test != 'canvas_stubs_test'
         uses: actions/cache@v4
         with:
           path: |
@@ -243,7 +243,7 @@ jobs:
       - name: cargo test --test ${{ matrix.test }}
         if: |
           steps.framework.outcome == 'success' ||
-          (matrix.test != 'canvas_stubs_test' && matrix.test != 'ui_stubs_test')
+          matrix.test != 'canvas_stubs_test'
         working-directory: clean-server
         run: cargo test --test ${{ matrix.test }}
 
