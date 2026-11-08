@@ -30,6 +30,36 @@ pub fn is_rtl(locale: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Locale detection
+// ---------------------------------------------------------------------------
+
+/// Where a request's locale comes from (frame.locale `locale: detection`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detection {
+    /// The `Accept-Language` request header, matched against the loaded locales.
+    Header,
+    /// The `cl_locale` cookie.
+    Cookie,
+    /// The `?locale=` query parameter.
+    Query,
+    /// Only `locale.set()` changes the locale.
+    Manual,
+}
+
+impl Detection {
+    /// Parse a `detection` value: `header`, `cookie`, `query` or `manual`.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "header" => Some(Self::Header),
+            "cookie" => Some(Self::Cookie),
+            "query" => Some(Self::Query),
+            "manual" => Some(Self::Manual),
+            _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Translation store
 // ---------------------------------------------------------------------------
 
@@ -44,6 +74,12 @@ pub struct LocaleState {
     pub translations: HashMap<String, HashMap<String, String>>,
     /// Locales in the order their translations were first loaded.
     load_order: Vec<String>,
+    /// The detection strategy set by `_i18n_configure`. `None` (a module
+    /// that never configured one) checks the `?locale=` query parameter,
+    /// then the `cl_locale` cookie, then `Accept-Language`.
+    pub detection: Option<Detection>,
+    /// `_i18n_configure` named the fallback locale explicitly.
+    fallback_configured: bool,
 }
 
 impl LocaleState {
@@ -54,6 +90,70 @@ impl LocaleState {
             default_locale,
             translations: HashMap::new(),
             load_order: Vec::new(),
+            detection: None,
+            fallback_configured: false,
+        }
+    }
+
+    /// Apply a `locale:` block (`_i18n_configure`): the default and fallback
+    /// locales (an empty fallback means the default) and the detection
+    /// strategy.
+    pub fn configure(&mut self, default_locale: &str, fallback_locale: &str, detection: Detection) {
+        self.default_locale = default_locale.to_string();
+        self.fallback_locale = if fallback_locale.is_empty() {
+            default_locale.to_string()
+        } else {
+            fallback_locale.to_string()
+        };
+        self.fallback_configured = true;
+        self.detection = Some(detection);
+    }
+
+    /// Load every translation file `<tag>.json` in `dir`, in file-name order;
+    /// the file stem is the locale tag. Returns the loaded tags, or the
+    /// errors (unreadable folder, unreadable or invalid file) — a bad file
+    /// does not stop the others from loading.
+    pub fn load_dir(&mut self, dir: &std::path::Path) -> Result<Vec<String>, Vec<String>> {
+        let entries = std::fs::read_dir(dir).map_err(|e| {
+            vec![format!(
+                "_i18n_configure: cannot read translations folder '{}': {}",
+                dir.display(),
+                e
+            )]
+        })?;
+        let mut files: Vec<std::path::PathBuf> = entries
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| {
+                path.is_file() && path.extension().and_then(|x| x.to_str()) == Some("json")
+            })
+            .collect();
+        files.sort();
+        let mut loaded = Vec::new();
+        let mut errors = Vec::new();
+        for path in files {
+            let Some(tag) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(json) => match self.load_json(&tag, &json) {
+                    Ok(()) => loaded.push(tag),
+                    Err(e) => errors.push(e),
+                },
+                Err(e) => errors.push(format!(
+                    "_i18n_configure: cannot read '{}': {}",
+                    path.display(),
+                    e
+                )),
+            }
+        }
+        if errors.is_empty() {
+            Ok(loaded)
+        } else {
+            Err(errors)
         }
     }
 
@@ -63,8 +163,12 @@ impl LocaleState {
     /// then the fallback locale's (only when it differs), then selects the
     /// default. The fallback is therefore the first loaded locale other than
     /// the default; with none, the default is its own fallback.
+    /// With a fallback set by `_i18n_configure`, only the default changes.
     pub fn set_default_locale(&mut self, locale: &str) {
         self.default_locale = locale.to_string();
+        if self.fallback_configured {
+            return;
+        }
         self.fallback_locale = self
             .load_order
             .iter()
@@ -927,6 +1031,58 @@ mod tests {
         assert_eq!(state.translate("bye", "fr", "{}"), "Goodbye");
         // Requested locale without a bundle -> default first.
         assert_eq!(state.translate("hello", "de", "{}"), "Bonjour");
+    }
+
+    #[test]
+    fn test_configure_sets_default_fallback_and_detection() {
+        let mut state = LocaleState::new("en");
+        state.load_json("de", r#"{"hello": "Hallo"}"#).unwrap();
+        state.configure("fr", "en", Detection::Cookie);
+        assert_eq!(state.default_locale, "fr");
+        assert_eq!(state.fallback_locale, "en");
+        assert_eq!(state.detection, Some(Detection::Cookie));
+        // A later startup locale.set changes the default, not the fallback.
+        state.set_default_locale("de");
+        assert_eq!(state.default_locale, "de");
+        assert_eq!(state.fallback_locale, "en");
+        // An empty fallback is the default.
+        state.configure("es", "", Detection::Header);
+        assert_eq!(state.fallback_locale, "es");
+    }
+
+    #[test]
+    fn test_detection_parse() {
+        assert_eq!(Detection::parse("header"), Some(Detection::Header));
+        assert_eq!(Detection::parse("cookie"), Some(Detection::Cookie));
+        assert_eq!(Detection::parse("query"), Some(Detection::Query));
+        assert_eq!(Detection::parse("manual"), Some(Detection::Manual));
+        assert_eq!(Detection::parse("Header"), None);
+        assert_eq!(Detection::parse("session"), None);
+    }
+
+    #[test]
+    fn test_load_dir_loads_every_json_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("en.json"), r#"{"a": {"b": "AB"}}"#).unwrap();
+        std::fs::write(dir.path().join("pt-BR.json"), r#"{"a": {"b": "ab-br"}}"#).unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "skip").unwrap();
+        let mut state = LocaleState::new("en");
+        assert_eq!(
+            state.load_dir(dir.path()).unwrap(),
+            vec!["en".to_string(), "pt-BR".to_string()]
+        );
+        assert_eq!(state.translate("a.b", "pt-BR", "{}"), "ab-br");
+
+        // A bad file is reported; the good ones still load.
+        std::fs::write(dir.path().join("broken.json"), "{not json").unwrap();
+        let mut state = LocaleState::new("en");
+        let errors = state.load_dir(dir.path()).unwrap_err();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("broken"), "{errors:?}");
+        assert_eq!(state.translate("a.b", "en", "{}"), "AB");
+
+        let missing = dir.path().join("nope");
+        assert!(LocaleState::new("en").load_dir(&missing).is_err());
     }
 
     #[test]
