@@ -17,7 +17,9 @@
 //!
 //! See system-documents/TEST_STRATEGY.md § 4.
 
+use std::collections::BTreeSet;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// A minimal Clean-shaped WASM: exports `memory`, `__heap_ptr` (global i32
@@ -44,11 +46,57 @@ fn locate_server_binary() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Pick a port unlikely to collide with other tests in this crate.
+/// Pick a free port that no other test in this binary has been given.
 ///
-/// The rest of the integration suite uses 13000+. We stay clear of that band.
+/// `portpicker` only checks that a port is free at the moment of the call;
+/// it does not reserve it. The tests here run in parallel, so two of them
+/// could draw the same port: one test's readiness probe then connects to the
+/// other test's server, which is killed moments later, and the HTTP request
+/// fails ("error sending request") before this test's own server has even
+/// bound. Ports are therefore handed out at most once per process.
 fn pick_port() -> u16 {
-    portpicker::pick_unused_port().expect("no free TCP port available for smoke test")
+    static TAKEN: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+    loop {
+        let port =
+            portpicker::pick_unused_port().expect("no free TCP port available for smoke test");
+        if TAKEN.lock().expect("port registry poisoned").insert(port) {
+            return port;
+        }
+    }
+}
+
+/// Wait until `child` — and not some other process — serves `port`.
+///
+/// A successful TCP connect alone does not prove readiness: the port could
+/// belong to someone else. The server logs `Server listening on
+/// http://<addr>` just before it binds, so readiness is that line in *this*
+/// child's stderr, the child still running, and the port accepting
+/// connections.
+fn wait_for_server(
+    child: &mut std::process::Child,
+    port: u16,
+    stderr_log: &std::path::Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    let listening = format!("Server listening on http://127.0.0.1:{port}");
+    let addr = format!("127.0.0.1:{port}").parse().unwrap();
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!("clean-server exited before serving: {status}"));
+        }
+        let logged = std::fs::read_to_string(stderr_log)
+            .map(|log| log.contains(&listening))
+            .unwrap_or(false);
+        if logged && std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
+        {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Err(format!(
+        "clean-server did not serve 127.0.0.1:{port} within {timeout:?}"
+    ))
 }
 
 #[test]
@@ -87,31 +135,13 @@ fn server_boots_serves_and_shuts_down() {
         .spawn()
         .expect("spawn clean-server");
 
-    // Poll TCP until the port answers or we time out.
-    let deadline = Instant::now() + Duration::from_secs(15);
-    let mut connected = false;
-    while Instant::now() < deadline {
-        if std::net::TcpStream::connect_timeout(
-            &format!("127.0.0.1:{port}").parse().unwrap(),
-            Duration::from_millis(200),
-        )
-        .is_ok()
-        {
-            connected = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    if !connected {
+    // Wait until this server (not just any process on the port) is serving.
+    if let Err(why) = wait_for_server(&mut child, port, &stderr_log, Duration::from_secs(15)) {
         let _ = child.kill();
         let _ = child.wait();
         let out = std::fs::read_to_string(&stdout_log).unwrap_or_default();
         let err = std::fs::read_to_string(&stderr_log).unwrap_or_default();
-        panic!(
-            "server_smoke_test: clean-server did not accept TCP connections on 127.0.0.1:{port} \
-             within 15 seconds.\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
-        );
+        panic!("server_smoke_test: {why}\n--- stdout ---\n{out}\n--- stderr ---\n{err}");
     }
 
     // Issue a single blocking HTTP request. We don't care what the status is
@@ -207,22 +237,6 @@ fn spawn_server(dir: &std::path::Path, wasm: &[u8], args: &[&str]) -> std::proce
         .expect("spawn clean-server")
 }
 
-fn wait_for_port(port: u16, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if std::net::TcpStream::connect_timeout(
-            &format!("127.0.0.1:{port}").parse().unwrap(),
-            Duration::from_millis(200),
-        )
-        .is_ok()
-        {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    false
-}
-
 fn stop(mut child: std::process::Child, dir: &std::path::Path) -> (String, String) {
     let _ = child.kill();
     let _ = child.wait();
@@ -236,11 +250,16 @@ fn stop(mut child: std::process::Child, dir: &std::path::Path) -> (String, Strin
 fn module_declared_port_is_bound_without_cli_port() {
     let temp = tempfile::tempdir().expect("tempdir");
     let port = pick_port();
-    let child = spawn_server(temp.path(), &listen_module(port), &["--host", "127.0.0.1"]);
-    let up = wait_for_port(port, Duration::from_secs(15));
+    let mut child = spawn_server(temp.path(), &listen_module(port), &["--host", "127.0.0.1"]);
+    let up = wait_for_server(
+        &mut child,
+        port,
+        &temp.path().join("server.err"),
+        Duration::from_secs(15),
+    );
     let (out, err) = stop(child, temp.path());
     assert!(
-        up,
+        up.is_ok(),
         "server did not bind the module's `server: port:` {port}\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
     );
 }
@@ -250,15 +269,20 @@ fn explicit_cli_port_wins_over_module_port() {
     let temp = tempfile::tempdir().expect("tempdir");
     let module_port = pick_port();
     let cli_port = pick_port();
-    let child = spawn_server(
+    let mut child = spawn_server(
         temp.path(),
         &listen_module(module_port),
         &["--host", "127.0.0.1", "--port", &cli_port.to_string()],
     );
-    let up = wait_for_port(cli_port, Duration::from_secs(15));
+    let up = wait_for_server(
+        &mut child,
+        cli_port,
+        &temp.path().join("server.err"),
+        Duration::from_secs(15),
+    );
     let (out, err) = stop(child, temp.path());
     assert!(
-        up,
+        up.is_ok(),
         "server did not bind the explicit --port {cli_port}\n--- stdout ---\n{out}\n--- stderr ---\n{err}"
     );
 }
@@ -270,14 +294,22 @@ fn server_logs_go_to_stderr_not_stdout() {
     let temp = tempfile::tempdir().expect("tempdir");
     let port = pick_port();
     let wasm = wat::parse_str(NOOP_WAT).expect("no-op WAT");
-    let child = spawn_server(
+    let mut child = spawn_server(
         temp.path(),
         &wasm,
         &["--host", "127.0.0.1", "--port", &port.to_string()],
     );
-    let up = wait_for_port(port, Duration::from_secs(15));
+    let up = wait_for_server(
+        &mut child,
+        port,
+        &temp.path().join("server.err"),
+        Duration::from_secs(15),
+    );
     let (out, err) = stop(child, temp.path());
-    assert!(up, "server did not start\n--- stderr ---\n{err}");
+    assert!(
+        up.is_ok(),
+        "server did not start: {up:?}\n--- stderr ---\n{err}"
+    );
     assert_eq!(out, "", "nothing but application output may reach stdout");
     assert!(
         err.contains("Server listening"),
