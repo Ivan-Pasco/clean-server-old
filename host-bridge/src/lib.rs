@@ -8,6 +8,7 @@ pub mod error;
 mod fs;
 mod http;
 mod log;
+mod mysql_sql;
 mod sys;
 mod time;
 pub mod wasm_linker;

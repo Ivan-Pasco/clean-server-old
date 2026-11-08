@@ -1,7 +1,8 @@
+use crate::mysql_sql::{self, Action, IndexSpec, Returning, TableRef};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sqlx::mysql::{MySqlPool, MySqlPoolOptions, MySqlRow};
+use sqlx::mysql::{MySqlConnection, MySqlPool, MySqlPoolOptions, MySqlRow};
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions, SqliteRow};
 use sqlx::{Column, Row, TypeInfo};
@@ -41,6 +42,15 @@ impl DatabaseDriver {
             Ok(Self::Postgres(pool))
         } else if url.starts_with("mysql://") || url.starts_with("mariadb://") {
             let pool = MySqlPoolOptions::new()
+                // frame.data's grouped `find:` selects the model's columns
+                // with `group:` (one row per group, as on SQLite), which
+                // ONLY_FULL_GROUP_BY rejects.
+                .after_connect(|conn, _meta| {
+                    Box::pin(async move {
+                        sqlx::query(MYSQL_SESSION_SQL_MODE).execute(conn).await?;
+                        Ok(())
+                    })
+                })
                 .max_connections(config.max_connections)
                 .min_connections(config.min_connections)
                 .acquire_timeout(Duration::from_millis(config.connection_timeout))
@@ -86,7 +96,7 @@ impl DatabaseDriver {
     ) -> Result<Vec<serde_json::Map<String, Value>>> {
         match self {
             Self::Postgres(pool) => Self::query_postgres(pool, sql, params).await,
-            Self::MySql(pool) => Self::query_mysql(pool, sql, params).await,
+            Self::MySql(pool) => Self::query_mysql(&mut *pool.acquire().await?, sql, params).await,
             Self::Sqlite(pool) => Self::query_sqlite(pool, sql, params).await,
         }
     }
@@ -95,7 +105,9 @@ impl DatabaseDriver {
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult> {
         match self {
             Self::Postgres(pool) => Self::execute_postgres(pool, sql, params).await,
-            Self::MySql(pool) => Self::execute_mysql(pool, sql, params).await,
+            Self::MySql(pool) => {
+                Self::execute_mysql(&mut *pool.acquire().await?, sql, params).await
+            }
             Self::Sqlite(pool) => Self::execute_sqlite(pool, sql, params).await,
         }
     }
@@ -314,6 +326,7 @@ impl DatabaseDriver {
         Ok(ExecuteResult {
             rows_affected: result.rows_affected(),
             last_insert_id: None, // PostgreSQL uses RETURNING clause instead
+            rows: None,
         })
     }
 
@@ -339,29 +352,284 @@ impl DatabaseDriver {
     // MySQL Implementation
     // ========================================================================
 
-    async fn query_mysql<'c, E>(
-        executor: E,
+    /// Run `sql` on MySQL and return the rows of its (last) statement.
+    /// The SQL is translated for MySQL first (see [`mysql_sql`]).
+    async fn query_mysql(
+        conn: &mut MySqlConnection,
         sql: &str,
         params: &[Value],
-    ) -> Result<Vec<serde_json::Map<String, Value>>>
-    where
-        E: sqlx::Executor<'c, Database = sqlx::MySql>,
-    {
-        let mut query = sqlx::query(sql);
+    ) -> Result<Vec<serde_json::Map<String, Value>>> {
+        Ok(Self::run_mysql(conn, sql, params, true)
+            .await?
+            .rows
+            .unwrap_or_default())
+    }
 
-        for param in params {
+    /// Translate `sql` for MySQL and run its statements in order on `conn`
+    /// — one connection, so a transaction, `LAST_INSERT_ID()` and the
+    /// follow-up reads of `INSERT ... RETURNING` all see the same session.
+    /// `fetch`: the caller wants rows (a query) rather than a row count.
+    async fn run_mysql(
+        conn: &mut MySqlConnection,
+        sql: &str,
+        params: &[Value],
+        fetch: bool,
+    ) -> Result<MySqlOutcome> {
+        let statements =
+            mysql_sql::translate(sql, params.len()).map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut out = MySqlOutcome::default();
+        for statement in &statements {
+            let binds: Vec<&Value> = statement.binds.iter().map(|&i| &params[i]).collect();
+            match &statement.action {
+                Action::Run if fetch => {
+                    out.rows = Some(Self::mysql_fetch(conn, &statement.sql, &binds).await?);
+                }
+                Action::Run => {
+                    let done = Self::mysql_exec(conn, &statement.sql, &binds).await?;
+                    out.record(&done);
+                }
+                Action::InsertReturning { table, columns } => {
+                    let done = Self::mysql_exec(conn, &statement.sql, &binds).await?;
+                    out.record(&done);
+                    let rows = Self::mysql_returning(
+                        conn,
+                        table,
+                        columns,
+                        done.last_insert_id(),
+                        done.rows_affected(),
+                    )
+                    .await?;
+                    out.rows = Some(rows);
+                }
+                Action::CreateIndex(spec) => {
+                    if let Some(done) = Self::mysql_create_index(conn, spec).await? {
+                        out.record(&done);
+                    }
+                }
+                Action::DropIndex {
+                    name,
+                    table,
+                    if_exists,
+                } => {
+                    if let Some(done) =
+                        Self::mysql_drop_index(conn, name, table.as_ref(), *if_exists).await?
+                    {
+                        out.record(&done);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn mysql_bound<'q>(
+        sql: &'q str,
+        binds: &[&Value],
+    ) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
+        let mut query = sqlx::query(sql);
+        for param in binds {
             query = Self::bind_param_mysql(query, param);
         }
+        query
+    }
 
-        let rows = query.fetch_all(executor).await?;
+    async fn mysql_fetch(
+        conn: &mut MySqlConnection,
+        sql: &str,
+        binds: &[&Value],
+    ) -> Result<Vec<serde_json::Map<String, Value>>> {
+        let rows = Self::mysql_bound(sql, binds).fetch_all(&mut *conn).await?;
+        rows.iter().map(Self::row_to_json_mysql).collect()
+    }
 
-        let mut result = Vec::new();
-        for row in rows {
-            let map = Self::row_to_json_mysql(&row)?;
-            result.push(map);
+    async fn mysql_exec(
+        conn: &mut MySqlConnection,
+        sql: &str,
+        binds: &[&Value],
+    ) -> Result<sqlx::mysql::MySqlQueryResult> {
+        Ok(Self::mysql_bound(sql, binds).execute(&mut *conn).await?)
+    }
+
+    /// The single string column `col` of each row of an introspection query.
+    async fn mysql_names(
+        conn: &mut MySqlConnection,
+        sql: &str,
+        binds: &[&Value],
+    ) -> Result<Vec<String>> {
+        Ok(Self::mysql_fetch(conn, sql, binds)
+            .await?
+            .iter()
+            .filter_map(|row| row.get("col").and_then(|v| v.as_str()).map(String::from))
+            .collect())
+    }
+
+    fn mysql_schema(table: &TableRef) -> Value {
+        table
+            .schema
+            .as_ref()
+            .map(|s| Value::String(s.clone()))
+            .unwrap_or(Value::Null)
+    }
+
+    /// The rows an `INSERT ... RETURNING` created: `count` rows whose
+    /// AUTO_INCREMENT key starts at `first_id` (MySQL assigns one statement's
+    /// keys consecutively), with the requested columns.
+    async fn mysql_returning(
+        conn: &mut MySqlConnection,
+        table: &TableRef,
+        columns: &Returning,
+        first_id: u64,
+        count: u64,
+    ) -> Result<Vec<serde_json::Map<String, Value>>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let schema = Self::mysql_schema(table);
+        let name = Value::String(table.name.clone());
+        let key = Self::mysql_names(
+            conn,
+            "SELECT CAST(COLUMN_NAME AS CHAR) AS col FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ? \
+             AND EXTRA LIKE '%auto_increment%'",
+            &[&schema, &name],
+        )
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "INSERT ... RETURNING on MySQL needs an AUTO_INCREMENT key on table `{}`",
+                table.name
+            )
+        })?;
+        if first_id == 0 {
+            return Err(anyhow::anyhow!(
+                "INSERT ... RETURNING on MySQL needs the new row's `{}` generated by AUTO_INCREMENT",
+                key
+            ));
+        }
+        let first = first_id as i64;
+        let last = first + count as i64 - 1;
+
+        // Only the key requested: the ids are known without a read.
+        if let Returning::Columns(cols) = columns {
+            if cols.iter().all(|c| c.column.eq_ignore_ascii_case(&key)) {
+                return Ok((first..=last)
+                    .map(|id| {
+                        cols.iter()
+                            .map(|c| (c.label.clone(), json!(id)))
+                            .collect::<serde_json::Map<String, Value>>()
+                    })
+                    .collect());
+            }
         }
 
-        Ok(result)
+        let select = match columns {
+            Returning::All => "*".to_string(),
+            Returning::Columns(cols) => cols
+                .iter()
+                .map(|c| format!("{} AS {}", quote_mysql(&c.column), quote_mysql(&c.label)))
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
+        let key = quote_mysql(&key);
+        let sql = format!(
+            "SELECT {} FROM {} WHERE {} BETWEEN ? AND ? ORDER BY {}",
+            select, table.sql, key, key
+        );
+        Self::mysql_fetch(conn, &sql, &[&json!(first), &json!(last)]).await
+    }
+
+    /// Whether index `name` exists on `table`.
+    async fn mysql_index_exists(
+        conn: &mut MySqlConnection,
+        table: &TableRef,
+        name: &str,
+    ) -> Result<bool> {
+        let rows = Self::mysql_fetch(
+            conn,
+            "SELECT 1 AS present FROM information_schema.STATISTICS \
+             WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ? AND INDEX_NAME = ? LIMIT 1",
+            &[
+                &Self::mysql_schema(table),
+                &Value::String(table.name.clone()),
+                &Value::String(name.to_string()),
+            ],
+        )
+        .await?;
+        Ok(!rows.is_empty())
+    }
+
+    /// `CREATE INDEX`: nothing to do when IF NOT EXISTS finds it; TEXT/BLOB
+    /// columns are indexed by prefix (MySQL cannot key them whole).
+    async fn mysql_create_index(
+        conn: &mut MySqlConnection,
+        spec: &IndexSpec,
+    ) -> Result<Option<sqlx::mysql::MySqlQueryResult>> {
+        if spec.if_not_exists && Self::mysql_index_exists(conn, &spec.table, &spec.name).await? {
+            return Ok(None);
+        }
+        let text_columns: std::collections::HashSet<String> = Self::mysql_names(
+            conn,
+            "SELECT CAST(COLUMN_NAME AS CHAR) AS col FROM information_schema.COLUMNS \
+             WHERE TABLE_SCHEMA = COALESCE(?, DATABASE()) AND TABLE_NAME = ? \
+             AND DATA_TYPE IN ('tinytext', 'text', 'mediumtext', 'longtext', \
+             'tinyblob', 'blob', 'mediumblob', 'longblob')",
+            &[
+                &Self::mysql_schema(&spec.table),
+                &Value::String(spec.table.name.clone()),
+            ],
+        )
+        .await?
+        .into_iter()
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+        let sql = spec.render(&text_columns);
+        Ok(Some(Self::mysql_exec(conn, &sql, &[]).await?))
+    }
+
+    /// `DROP INDEX <name> [ON <table>]`: MySQL needs the table, so a
+    /// statement without one drops the index of that name in the current
+    /// database.
+    async fn mysql_drop_index(
+        conn: &mut MySqlConnection,
+        name: &str,
+        table: Option<&TableRef>,
+        if_exists: bool,
+    ) -> Result<Option<sqlx::mysql::MySqlQueryResult>> {
+        let table_sql = match table {
+            Some(t) => {
+                if if_exists && !Self::mysql_index_exists(conn, t, name).await? {
+                    return Ok(None);
+                }
+                t.sql.clone()
+            }
+            None => {
+                let tables = Self::mysql_names(
+                    conn,
+                    "SELECT DISTINCT CAST(TABLE_NAME AS CHAR) AS col FROM information_schema.STATISTICS \
+                     WHERE TABLE_SCHEMA = DATABASE() AND INDEX_NAME = ?",
+                    &[&Value::String(name.to_string())],
+                )
+                .await?;
+                match tables.as_slice() {
+                    [] if if_exists => return Ok(None),
+                    [] => {
+                        return Err(anyhow::anyhow!("DROP INDEX: index `{}` does not exist", name))
+                    }
+                    [one] => quote_mysql(one),
+                    _ => {
+                        return Err(anyhow::anyhow!(
+                            "DROP INDEX: index `{}` exists on several tables ({}); name the table with ON",
+                            name,
+                            tables.join(", ")
+                        ))
+                    }
+                }
+            }
+        };
+        let sql = format!("DROP INDEX {} ON {}", name, table_sql);
+        Ok(Some(Self::mysql_exec(conn, &sql, &[]).await?))
     }
 
     fn bind_param_mysql<'q>(
@@ -420,6 +688,15 @@ impl DatabaseDriver {
                     .try_get::<i64, _>(i)
                     .map(|v| json!(v))
                     .unwrap_or(Value::Null),
+                // MySQL's SERIAL is BIGINT UNSIGNED.
+                "TINYINT UNSIGNED" | "SMALLINT UNSIGNED" | "MEDIUMINT UNSIGNED"
+                | "INT UNSIGNED" | "BIGINT UNSIGNED" | "YEAR" => row
+                    .try_get::<u64, _>(i)
+                    .map(|v| json!(v))
+                    .or_else(|_| row.try_get::<u32, _>(i).map(|v| json!(v)))
+                    .or_else(|_| row.try_get::<u16, _>(i).map(|v| json!(v)))
+                    .or_else(|_| row.try_get::<u8, _>(i).map(|v| json!(v)))
+                    .unwrap_or(Value::Null),
                 "FLOAT" => row
                     .try_get::<f32, _>(i)
                     .map(|v| json!(v))
@@ -438,8 +715,13 @@ impl DatabaseDriver {
                     .try_get::<String, _>(i)
                     .map(|v| json!(v))
                     .unwrap_or(Value::Null),
+                // DATETIME decodes as a naive time, TIMESTAMP as UTC.
                 "TIMESTAMP" | "DATETIME" => row
                     .try_get::<chrono::NaiveDateTime, _>(i)
+                    .or_else(|_| {
+                        row.try_get::<chrono::DateTime<chrono::Utc>, _>(i)
+                            .map(|v| v.naive_utc())
+                    })
                     .map(|v| json!(v.to_string()))
                     .unwrap_or(Value::Null),
                 "DATE" => row
@@ -476,21 +758,18 @@ impl DatabaseDriver {
         Ok(map)
     }
 
-    async fn execute_mysql<'c, E>(executor: E, sql: &str, params: &[Value]) -> Result<ExecuteResult>
-    where
-        E: sqlx::Executor<'c, Database = sqlx::MySql>,
-    {
-        let mut query = sqlx::query(sql);
-
-        for param in params {
-            query = Self::bind_param_mysql(query, param);
-        }
-
-        let result = query.execute(executor).await?;
-
+    /// Run an INSERT/UPDATE/DELETE (or DDL) on MySQL; an `INSERT ...
+    /// RETURNING` also answers the new rows.
+    async fn execute_mysql(
+        conn: &mut MySqlConnection,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecuteResult> {
+        let out = Self::run_mysql(conn, sql, params, false).await?;
         Ok(ExecuteResult {
-            rows_affected: result.rows_affected(),
-            last_insert_id: Some(result.last_insert_id() as i64),
+            rows_affected: out.rows_affected,
+            last_insert_id: Some(out.last_insert_id),
+            rows: out.rows,
         })
     }
 
@@ -501,11 +780,7 @@ impl DatabaseDriver {
         let mut tx = pool.begin().await?;
 
         for (sql, params) in operations {
-            let mut query = sqlx::query(sql);
-            for param in params {
-                query = Self::bind_param_mysql(query, param);
-            }
-            query.execute(&mut *tx).await?;
+            Self::execute_mysql(&mut tx, sql, params).await?;
         }
 
         tx.commit().await?;
@@ -617,6 +892,7 @@ impl DatabaseDriver {
         Ok(ExecuteResult {
             rows_affected: result.rows_affected(),
             last_insert_id: Some(result.last_insert_rowid()),
+            rows: None,
         })
     }
 
@@ -662,7 +938,7 @@ impl OpenTransaction {
     ) -> Result<Vec<serde_json::Map<String, Value>>> {
         match self {
             Self::Postgres(tx) => DatabaseDriver::query_postgres(&mut **tx, sql, params).await,
-            Self::MySql(tx) => DatabaseDriver::query_mysql(&mut **tx, sql, params).await,
+            Self::MySql(tx) => DatabaseDriver::query_mysql(tx, sql, params).await,
             Self::Sqlite(tx) => DatabaseDriver::query_sqlite(&mut **tx, sql, params).await,
         }
     }
@@ -671,7 +947,7 @@ impl OpenTransaction {
     pub async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<ExecuteResult> {
         match self {
             Self::Postgres(tx) => DatabaseDriver::execute_postgres(&mut **tx, sql, params).await,
-            Self::MySql(tx) => DatabaseDriver::execute_mysql(&mut **tx, sql, params).await,
+            Self::MySql(tx) => DatabaseDriver::execute_mysql(tx, sql, params).await,
             Self::Sqlite(tx) => DatabaseDriver::execute_sqlite(&mut **tx, sql, params).await,
         }
     }
@@ -864,6 +1140,35 @@ pub struct DbResult {
 pub struct ExecuteResult {
     pub rows_affected: u64,
     pub last_insert_id: Option<i64>,
+    /// The rows a `RETURNING` clause answers (`None` without one).
+    pub rows: Option<Vec<serde_json::Map<String, Value>>>,
+}
+
+/// What running a (translated, possibly multi-statement) SQL text on MySQL
+/// produced: the rows of the last row-producing statement, and the summed
+/// row count and last generated key of its writes.
+#[derive(Debug, Default)]
+struct MySqlOutcome {
+    rows: Option<Vec<serde_json::Map<String, Value>>>,
+    rows_affected: u64,
+    last_insert_id: i64,
+}
+
+impl MySqlOutcome {
+    fn record(&mut self, done: &sqlx::mysql::MySqlQueryResult) {
+        self.rows_affected += done.rows_affected();
+        self.last_insert_id = done.last_insert_id() as i64;
+    }
+}
+
+/// Drop ONLY_FULL_GROUP_BY from a MySQL session's sql_mode, keeping the
+/// rest (sqlx adds PIPES_AS_CONCAT, so `||` concatenates).
+const MYSQL_SESSION_SQL_MODE: &str = "SET SESSION sql_mode = TRIM(BOTH ',' FROM \
+     REPLACE(CONCAT(',', @@SESSION.sql_mode, ','), ',ONLY_FULL_GROUP_BY,', ','))";
+
+/// `name` as a MySQL identifier: `` `name` ``.
+fn quote_mysql(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
 }
 
 /// Transaction state
@@ -1258,13 +1563,18 @@ impl DbBridge {
         .await;
 
         match result {
-            Ok(Ok(exec_result)) => Ok(json!({
-                "ok": true,
-                "data": {
+            Ok(Ok(exec_result)) => {
+                let mut data = json!({
                     "affected_rows": exec_result.rows_affected,
                     "last_insert_id": exec_result.last_insert_id
+                });
+                // `RETURNING`: the rows, in the shape query() answers.
+                if let Some(rows) = exec_result.rows {
+                    data["count"] = json!(rows.len());
+                    data["rows"] = Value::Array(rows.into_iter().map(Value::Object).collect());
                 }
-            })),
+                Ok(json!({ "ok": true, "data": data }))
+            }
             Ok(Err(e)) => {
                 let (code, message) = self.categorize_error(&format!("{}", e));
                 Ok(json!({
@@ -4803,5 +5113,588 @@ mod integration_tests {
         bridge.call("execute", cleanup).await.unwrap();
 
         println!("PostgreSQL transaction test passed!");
+    }
+}
+
+/// frame.data's SQL on a real MySQL 8 (see `mysql_sql`). Runs when
+/// `CLEAN_TEST_MYSQL_URL` names a database the tests may create tables in,
+/// e.g. `mysql://root:pass@127.0.0.1:3306/clean_test`; skipped otherwise.
+/// Every test uses its own tables, so they can share one database.
+#[cfg(test)]
+mod mysql_dialect_tests {
+    use super::*;
+
+    async fn mysql_bridge() -> Option<DbBridge> {
+        let url = std::env::var("CLEAN_TEST_MYSQL_URL").ok()?;
+        let mut bridge = DbBridge::new();
+        bridge
+            .configure(DbConfig {
+                database_url: url,
+                max_connections: 4,
+                min_connections: 1,
+                connection_timeout: 10000,
+                query_timeout: 30000,
+            })
+            .await
+            .expect("CLEAN_TEST_MYSQL_URL must name a reachable MySQL database");
+        Some(bridge)
+    }
+
+    async fn exec(bridge: &mut DbBridge, sql: &str, params: Value) -> Value {
+        let r = bridge
+            .call("execute", json!({"sql": sql, "params": params}))
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], true, "execute failed: {}\n{:?}", sql, r);
+        r
+    }
+
+    async fn query(bridge: &mut DbBridge, sql: &str, params: Value) -> Vec<Value> {
+        let r = bridge
+            .call("query", json!({"sql": sql, "params": params}))
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], true, "query failed: {}\n{:?}", sql, r);
+        r["data"]["rows"].as_array().unwrap().clone()
+    }
+
+    async fn drop_tables(bridge: &mut DbBridge, tables: &[&str]) {
+        for t in tables {
+            exec(bridge, &format!("DROP TABLE IF EXISTS {}", t), json!([])).await;
+        }
+    }
+
+    /// The statements a frame.data model runs: migrate(), save() insert
+    /// and update, first/find/count/exists, delete().
+    #[tokio::test]
+    async fn frame_data_model_lifecycle() {
+        let Some(mut db) = mysql_bridge().await else {
+            return;
+        };
+        drop_tables(&mut db, &["fd_users"]).await;
+
+        // migrate(): the engine probe fails on MySQL, so the key is SERIAL.
+        let probe = db
+            .call(
+                "query",
+                json!({"sql": "SELECT sqlite_version() AS v", "params": []}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(probe["ok"], false);
+        let create = "CREATE TABLE IF NOT EXISTS fd_users (id SERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE, name TEXT NOT NULL, active BOOLEAN DEFAULT true, score REAL, created TIMESTAMP DEFAULT CURRENT_TIMESTAMP, token UUID, meta JSON, status TEXT DEFAULT 'new')";
+        exec(&mut db, create, json!([])).await;
+        exec(&mut db, create, json!([])).await;
+        let index = "CREATE INDEX IF NOT EXISTS idx_fd_users_name ON fd_users (name)";
+        exec(&mut db, index, json!([])).await;
+        exec(&mut db, index, json!([])).await;
+
+        // save() of a new row: INSERT ... RETURNING <key>.
+        let r = exec(
+            &mut db,
+            "INSERT INTO fd_users (email, name, active, score, token, meta) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            json!(["ann@example.com", "Ann", true, 1.5, "0b8f2c1e-1111-4a4a-8b8b-000000000001", "{\"tags\":[\"a\"]}"]),
+        )
+        .await;
+        assert_eq!(r["data"]["affected_rows"], 1);
+        assert_eq!(r["data"]["count"], 1);
+        let ann = r["data"]["rows"][0]["id"].as_i64().unwrap();
+        assert!(ann > 0);
+        assert_eq!(r["data"]["last_insert_id"], ann);
+        let r = exec(
+            &mut db,
+            "INSERT INTO fd_users (email, name) VALUES ($1, $2) RETURNING id",
+            json!(["bob@example.com", "Bob"]),
+        )
+        .await;
+        let bob = r["data"]["rows"][0]["id"].as_i64().unwrap();
+        assert_eq!(bob, ann + 1);
+
+        // RETURNING other columns reads the new row back.
+        let r = exec(
+            &mut db,
+            "INSERT INTO fd_users (email, name) VALUES ($1, $2) RETURNING id, name AS who, status, active",
+            json!(["cy@example.com", "Cy"]),
+        )
+        .await;
+        let row = &r["data"]["rows"][0];
+        assert_eq!(row["who"], "Cy");
+        assert_eq!(row["status"], "new");
+        assert_eq!(row["active"], true);
+        let cy = row["id"].as_i64().unwrap();
+        let r = exec(
+            &mut db,
+            "INSERT INTO fd_users (email, name) VALUES ($1, $2) RETURNING *",
+            json!(["dee@example.com", "Dee"]),
+        )
+        .await;
+        assert_eq!(r["data"]["rows"][0]["email"], "dee@example.com");
+
+        // save() of a loaded row: UPDATE with the key as $1 after the fields.
+        let r = exec(
+            &mut db,
+            "UPDATE fd_users SET email = $2, name = $3 WHERE id = $1",
+            json!([bob, "bob@example.com", "Robert"]),
+        )
+        .await;
+        assert_eq!(r["data"]["affected_rows"], 1);
+        // An unchanged row still counts as matched (save() falls back to
+        // INSERT when the UPDATE reports no row).
+        let r = exec(
+            &mut db,
+            "UPDATE fd_users SET email = $2, name = $3 WHERE id = $1",
+            json!([bob, "bob@example.com", "Robert"]),
+        )
+        .await;
+        assert_eq!(r["data"]["affected_rows"], 1);
+
+        // first / find / count / exists with bound where: values.
+        let rows = query(
+            &mut db,
+            "SELECT * FROM fd_users WHERE email = $1 LIMIT 1",
+            json!(["bob@example.com"]),
+        )
+        .await;
+        assert_eq!(rows[0]["name"], "Robert");
+        assert_eq!(rows[0]["id"], bob);
+        let rows = query(
+            &mut db,
+            "SELECT * FROM fd_users WHERE (name = $1 OR name = $2) AND active = true ORDER BY name DESC LIMIT 10 OFFSET 0",
+            json!(["Ann", "Robert"]),
+        )
+        .await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["name"], "Robert");
+        assert_eq!(rows[1]["meta"]["tags"][0], "a");
+        assert_eq!(rows[1]["token"], "0b8f2c1e-1111-4a4a-8b8b-000000000001");
+        let rows = query(
+            &mut db,
+            "SELECT COUNT(*) AS count FROM fd_users WHERE id IN ($1, $2, $3)",
+            json!([ann, bob, cy]),
+        )
+        .await;
+        assert_eq!(rows[0]["count"], 3);
+        let rows = query(
+            &mut db,
+            "SELECT 1 AS present FROM fd_users WHERE JSON_EXTRACT(meta, '$.tags[0]') = 'a' LIMIT 1",
+            json!([]),
+        )
+        .await;
+        assert_eq!(rows.len(), 1);
+        let rows = query(
+            &mut db,
+            "SELECT * FROM fd_users LIMIT 9223372036854775807 OFFSET 3",
+            json!([]),
+        )
+        .await;
+        assert_eq!(rows.len(), 1);
+
+        // delete(): the key, and nothing when it is gone.
+        let r = exec(&mut db, "DELETE FROM fd_users WHERE id = $1", json!([cy])).await;
+        assert_eq!(r["data"]["affected_rows"], 1);
+        let r = exec(&mut db, "DELETE FROM fd_users WHERE id = $1", json!([cy])).await;
+        assert_eq!(r["data"]["affected_rows"], 0);
+
+        // A duplicate unique value is a constraint error, not a crash.
+        let dup = db
+            .call(
+                "execute",
+                json!({"sql": "INSERT INTO fd_users (email, name) VALUES ($1, $2) RETURNING id", "params": ["ann@example.com", "Again"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dup["ok"], false);
+
+        drop_tables(&mut db, &["fd_users"]).await;
+    }
+
+    #[tokio::test]
+    async fn insert_default_values_and_string_keys() {
+        let Some(mut db) = mysql_bridge().await else {
+            return;
+        };
+        drop_tables(&mut db, &["fd_counters", "fd_docs"]).await;
+        exec(
+            &mut db,
+            "CREATE TABLE IF NOT EXISTS fd_counters (id SERIAL PRIMARY KEY)",
+            json!([]),
+        )
+        .await;
+        let r = exec(
+            &mut db,
+            "INSERT INTO fd_counters DEFAULT VALUES RETURNING id",
+            json!([]),
+        )
+        .await;
+        assert_eq!(r["data"]["rows"][0]["id"], 1);
+
+        // An assigned text key (uuid / string primary): no RETURNING.
+        exec(
+            &mut db,
+            "CREATE TABLE IF NOT EXISTS fd_docs (slug TEXT PRIMARY KEY, body TEXT)",
+            json!([]),
+        )
+        .await;
+        exec(
+            &mut db,
+            "INSERT INTO fd_docs (slug, body) VALUES ($1, $2)",
+            json!(["intro", "hello"]),
+        )
+        .await;
+        let r = exec(
+            &mut db,
+            "UPDATE fd_docs SET body = $2 WHERE slug = $1",
+            json!(["missing", "x"]),
+        )
+        .await;
+        assert_eq!(r["data"]["affected_rows"], 0);
+        drop_tables(&mut db, &["fd_counters", "fd_docs"]).await;
+    }
+
+    #[tokio::test]
+    async fn foreign_keys_cascade() {
+        let Some(mut db) = mysql_bridge().await else {
+            return;
+        };
+        drop_tables(&mut db, &["fd_comments", "fd_posts"]).await;
+        exec(
+            &mut db,
+            "CREATE TABLE IF NOT EXISTS fd_posts (id SERIAL PRIMARY KEY, title TEXT NOT NULL)",
+            json!([]),
+        )
+        .await;
+        exec(&mut db, "CREATE TABLE IF NOT EXISTS fd_comments (id SERIAL PRIMARY KEY, post_id INTEGER REFERENCES fd_posts(id) ON DELETE CASCADE, body TEXT)", json!([])).await;
+        exec(
+            &mut db,
+            "CREATE INDEX IF NOT EXISTS idx_fd_comments_post_id ON fd_comments (post_id)",
+            json!([]),
+        )
+        .await;
+        let r = exec(
+            &mut db,
+            "INSERT INTO fd_posts (title) VALUES ($1) RETURNING id",
+            json!(["Hello"]),
+        )
+        .await;
+        let post = r["data"]["rows"][0]["id"].as_i64().unwrap();
+        for body in ["a", "b"] {
+            exec(
+                &mut db,
+                "INSERT INTO fd_comments (post_id, body) VALUES ($1, $2) RETURNING id",
+                json!([post, body]),
+            )
+            .await;
+        }
+        // An unknown parent is refused.
+        let orphan = db
+            .call(
+                "execute",
+                json!({"sql": "INSERT INTO fd_comments (post_id, body) VALUES ($1, $2)", "params": [post + 100, "x"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(orphan["ok"], false);
+        // include: — a semi-join over a LEFT JOIN with the relation alias.
+        let rows = query(&mut db, "SELECT * FROM fd_posts WHERE fd_posts.id IN (SELECT fd_posts.id FROM fd_posts LEFT JOIN fd_comments comments ON comments.post_id = fd_posts.id WHERE comments.body = $1)", json!(["b"])).await;
+        assert_eq!(rows.len(), 1);
+        exec(&mut db, "DELETE FROM fd_posts WHERE id = $1", json!([post])).await;
+        let rows = query(&mut db, "SELECT COUNT(*) AS n FROM fd_comments", json!([])).await;
+        assert_eq!(rows[0]["n"], 0);
+        drop_tables(&mut db, &["fd_comments", "fd_posts"]).await;
+    }
+
+    /// `transaction:` — the statements run on the transaction's connection,
+    /// RETURNING reads the uncommitted row, rollback undoes it.
+    #[tokio::test]
+    async fn transactions_keep_returning_on_their_connection() {
+        let Some(mut db) = mysql_bridge().await else {
+            return;
+        };
+        drop_tables(&mut db, &["fd_tx"]).await;
+        exec(
+            &mut db,
+            "CREATE TABLE IF NOT EXISTS fd_tx (id SERIAL PRIMARY KEY, label TEXT, at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
+            json!([]),
+        )
+        .await;
+
+        let mut tx = db.begin_transaction().await.unwrap();
+        let r = db
+            .call_in(
+                "execute",
+                json!({"sql": "INSERT INTO fd_tx (label) VALUES ($1) RETURNING id, label, at", "params": ["inside"]}),
+                Some(&mut tx),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], true, "{:?}", r);
+        assert_eq!(r["data"]["rows"][0]["label"], "inside");
+        assert!(r["data"]["rows"][0]["at"].is_string());
+        let seen = db
+            .call_in(
+                "query",
+                json!({"sql": "SELECT COUNT(*) AS n FROM fd_tx WHERE label = $1", "params": ["inside"]}),
+                Some(&mut tx),
+            )
+            .await
+            .unwrap();
+        assert_eq!(seen["data"]["rows"][0]["n"], 1);
+        tx.rollback().await.unwrap();
+        let rows = query(&mut db, "SELECT COUNT(*) AS n FROM fd_tx", json!([])).await;
+        assert_eq!(rows[0]["n"], 0);
+
+        let mut tx = db.begin_transaction().await.unwrap();
+        db.call_in(
+            "execute",
+            json!({"sql": "INSERT INTO fd_tx (label) VALUES ($1) RETURNING id", "params": ["kept"]}),
+            Some(&mut tx),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        let rows = query(&mut db, "SELECT label FROM fd_tx", json!([])).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["label"], "kept");
+        drop_tables(&mut db, &["fd_tx"]).await;
+    }
+
+    /// A migrate block's up: SQL — several statements in one text, built by
+    /// the schema helpers.
+    #[tokio::test]
+    async fn migration_schema_helpers() {
+        let Some(mut db) = mysql_bridge().await else {
+            return;
+        };
+        drop_tables(&mut db, &["fd_gadgets", "fd_scratch"]).await;
+        exec(&mut db, "CREATE TABLE fd_gadgets (id SERIAL PRIMARY KEY, name TEXT NOT NULL, size INTEGER); CREATE INDEX idx_fd_gadgets_name_size ON fd_gadgets (name, size); ALTER TABLE fd_gadgets ADD COLUMN color TEXT DEFAULT 'red'; ALTER TABLE fd_gadgets RENAME COLUMN size TO weight; INSERT INTO fd_gadgets (name, weight) VALUES ('first', 3)", json!([])).await;
+        exec(&mut db, "CREATE TABLE fd_scratch (code TEXT PRIMARY KEY, label TEXT); DROP TABLE fd_scratch; ALTER TABLE fd_gadgets ADD COLUMN temp INTEGER; ALTER TABLE fd_gadgets DROP COLUMN temp; CREATE UNIQUE INDEX uniq_fd_gadgets_color ON fd_gadgets (color); DROP INDEX uniq_fd_gadgets_color; CREATE INDEX idx_fd_gadgets_weight ON fd_gadgets (weight); INSERT INTO fd_gadgets (name, weight, color) VALUES ('second', 5, 'blue')", json!([])).await;
+        let rows = query(
+            &mut db,
+            "SELECT id, name, weight, color FROM fd_gadgets ORDER BY id",
+            json!([]),
+        )
+        .await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["color"], "red");
+        assert_eq!(rows[1]["id"], 2);
+        let idx = query(&mut db, "SELECT DISTINCT INDEX_NAME AS name FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fd_gadgets' ORDER BY INDEX_NAME", json!([])).await;
+        let names: Vec<&str> = idx.iter().filter_map(|r| r["name"].as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "idx_fd_gadgets_name_size",
+                "idx_fd_gadgets_weight",
+                "PRIMARY"
+            ]
+        );
+        // dropIndex of a missing index fails; IF EXISTS does not.
+        let missing = db
+            .call(
+                "execute",
+                json!({"sql": "DROP INDEX uniq_fd_gadgets_color", "params": []}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing["ok"], false);
+        exec(
+            &mut db,
+            "DROP INDEX IF EXISTS uniq_fd_gadgets_color",
+            json!([]),
+        )
+        .await;
+        let scratch = query(&mut db, "SELECT COUNT(*) AS n FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'fd_scratch'", json!([])).await;
+        assert_eq!(scratch[0]["n"], 0);
+        drop_tables(&mut db, &["fd_gadgets"]).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_spellings_run_on_mysql() {
+        let Some(mut db) = mysql_bridge().await else {
+            return;
+        };
+        drop_tables(&mut db, &["fd_kv"]).await;
+        exec(
+            &mut db,
+            "CREATE TABLE IF NOT EXISTS fd_kv (k TEXT PRIMARY KEY, v TEXT, n INTEGER, seen TIMESTAMP)",
+            json!([]),
+        )
+        .await;
+        let upsert = "INSERT INTO fd_kv (k, v, n) VALUES ($1, $2, $3) ON CONFLICT (k) DO UPDATE SET v = EXCLUDED.v, n = fd_kv.n + EXCLUDED.n";
+        exec(&mut db, upsert, json!(["a", "one", 1])).await;
+        exec(&mut db, upsert, json!(["a", "two", 2])).await;
+        exec(
+            &mut db,
+            "INSERT INTO fd_kv (k, v) VALUES ($1, $2) ON CONFLICT (k) DO NOTHING",
+            json!(["a", "ignored"]),
+        )
+        .await;
+        exec(
+            &mut db,
+            "INSERT INTO fd_kv (k, v, seen) VALUES ($1, $2, NOW() - INTERVAL '2 days')",
+            json!(["B", "Bee"]),
+        )
+        .await;
+        let rows = query(&mut db, "SELECT * FROM fd_kv WHERE k = $1", json!(["a"])).await;
+        assert_eq!(rows[0]["v"], "two");
+        assert_eq!(rows[0]["n"], 3);
+        let rows = query(
+            &mut db,
+            "SELECT k FROM fd_kv WHERE seen < (NOW() - INTERVAL '1 days') AND v ILIKE $1",
+            json!(["bee"]),
+        )
+        .await;
+        assert_eq!(rows.len(), 1);
+        let rows = query(
+            &mut db,
+            "SELECT k FROM fd_kv ORDER BY seen ASC NULLS LAST, k",
+            json!([]),
+        )
+        .await;
+        assert_eq!(rows[0]["k"], "B");
+        assert_eq!(rows[1]["k"], "a");
+        let rows = query(
+            &mut db,
+            "SELECT k || ':' || v AS kv FROM fd_kv WHERE k = $1",
+            json!(["a"]),
+        )
+        .await;
+        assert_eq!(rows[0]["kv"], "a:two");
+
+        // RETURNING on UPDATE is refused with a message, not run.
+        let r = db
+            .call(
+                "execute",
+                json!({"sql": "UPDATE fd_kv SET v = $1 RETURNING k", "params": ["x"]}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], false);
+        assert!(r["err"]["message"].as_str().unwrap().contains("RETURNING"));
+        let rows = query(&mut db, "SELECT v FROM fd_kv WHERE k = 'a'", json!([])).await;
+        assert_eq!(rows[0]["v"], "two");
+        drop_tables(&mut db, &["fd_kv"]).await;
+    }
+
+    /// paginate / cursor: the `$n` of a `__where` envelope, bound on MySQL.
+    #[tokio::test]
+    async fn paginate_and_cursor_bind_where_values() {
+        let Some(mut db) = mysql_bridge().await else {
+            return;
+        };
+        drop_tables(&mut db, &["fd_pages"]).await;
+        exec(
+            &mut db,
+            "CREATE TABLE IF NOT EXISTS fd_pages (id SERIAL PRIMARY KEY, name TEXT NOT NULL)",
+            json!([]),
+        )
+        .await;
+        for name in ["Ann", "Bob", "Ann", "O'Brien", "Ann"] {
+            exec(
+                &mut db,
+                "INSERT INTO fd_pages (name) VALUES ($1) RETURNING id",
+                json!([name]),
+            )
+            .await;
+        }
+        let page = db
+            .call(
+                "paginate",
+                json!({"table": "fd_pages", "where": {"__where": "name = $1 OR name = $2", "__params": ["Ann", "O'Brien"], "__order": "id DESC"}, "page": 1, "per_page": 3}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page["ok"], true, "{:?}", page);
+        assert_eq!(page["data"]["total"], 4);
+        assert_eq!(page["data"]["data"][0]["id"], 5);
+        let first = db
+            .call(
+                "cursor_page",
+                json!({"table": "fd_pages", "where": {"__where": "name = $1", "__params": ["Ann"]}, "per_page": 2, "after": "", "by_field": "id"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first["data"]["has_more"], true);
+        let next = first["data"]["next_cursor"].to_string();
+        let second = db
+            .call(
+                "cursor_page",
+                json!({"table": "fd_pages", "where": {"__where": "name = $1", "__params": ["Ann"]}, "per_page": 2, "after": next, "by_field": "id"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second["data"]["data"].as_array().unwrap().len(), 1);
+        assert_eq!(second["data"]["has_more"], false);
+        drop_tables(&mut db, &["fd_pages"]).await;
+    }
+
+    /// `group:` without aggregates over every column: one row per group.
+    #[tokio::test]
+    async fn grouped_find_selects_model_columns() {
+        let Some(mut db) = mysql_bridge().await else {
+            return;
+        };
+        drop_tables(&mut db, &["fd_people"]).await;
+        exec(
+            &mut db,
+            "CREATE TABLE IF NOT EXISTS fd_people (id SERIAL PRIMARY KEY, name TEXT, age INTEGER)",
+            json!([]),
+        )
+        .await;
+        for (name, age) in [("a", 10), ("b", 10), ("c", 20)] {
+            exec(
+                &mut db,
+                "INSERT INTO fd_people (name, age) VALUES ($1, $2) RETURNING id",
+                json!([name, age]),
+            )
+            .await;
+        }
+        let rows = query(
+            &mut db,
+            "SELECT * FROM fd_people GROUP BY age HAVING age > $1",
+            json!([15]),
+        )
+        .await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "c");
+        let mode = query(&mut db, "SELECT @@SESSION.sql_mode AS m", json!([])).await;
+        let mode = mode[0]["m"].as_str().unwrap_or_default().to_string();
+        assert!(!mode.contains("ONLY_FULL_GROUP_BY"), "{}", mode);
+        assert!(mode.contains("PIPES_AS_CONCAT"), "{}", mode);
+        drop_tables(&mut db, &["fd_people"]).await;
+    }
+
+    /// Registered migrations (several statements each) apply once.
+    #[tokio::test]
+    async fn registered_migrations_apply_on_mysql() {
+        let Some(mut db) = mysql_bridge().await else {
+            return;
+        };
+        drop_tables(&mut db, &["fd_migrated"]).await;
+        // A previous run's record (the tracking table may not exist yet).
+        let _ = db
+            .call(
+                "execute",
+                json!({"sql": "DELETE FROM _clean_migrations WHERE name = 'fd_001'", "params": []}),
+            )
+            .await;
+        let r = db
+            .call(
+                "register_migration",
+                json!({"name": "fd_001", "up_sql": "CREATE TABLE fd_migrated (id SERIAL PRIMARY KEY, label TEXT NOT NULL); CREATE INDEX idx_fd_migrated_label ON fd_migrated (label); INSERT INTO fd_migrated (label) VALUES ('seed')", "down_sql": "DROP TABLE fd_migrated"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        db.run_pending_migrations().await.unwrap();
+        db.run_pending_migrations().await.unwrap();
+        let rows = query(&mut db, "SELECT label FROM fd_migrated", json!([])).await;
+        assert_eq!(rows.len(), 1);
+        exec(
+            &mut db,
+            "DELETE FROM _clean_migrations WHERE name = 'fd_001'",
+            json!([]),
+        )
+        .await;
+        drop_tables(&mut db, &["fd_migrated"]).await;
     }
 }
