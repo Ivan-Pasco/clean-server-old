@@ -151,12 +151,13 @@ jobs:
 
   # ---------------------------------------------------------------
   # T2 · MySQL 8 — frame.data's SQL translated for MySQL (host-bridge
-  # src/mysql_sql.rs) against a real server. The tests in
-  # `db::mysql_dialect_tests` skip themselves unless CLEAN_TEST_MYSQL_URL
-  # is set, so they run here only.
+  # src/mysql_sql.rs) against a real server, and PostgreSQL's
+  # INSERT ... RETURNING rows. The tests in `db::mysql_dialect_tests` /
+  # `db::postgres_returning_tests` skip themselves unless
+  # CLEAN_TEST_MYSQL_URL / CLEAN_TEST_PG_URL is set, so they run here only.
   # ---------------------------------------------------------------
   mysql:
-    name: T2 · MySQL 8 (frame.data dialect)
+    name: T2 · MySQL 8 + PostgreSQL (frame.data SQL)
     runs-on: ubuntu-latest
     needs: policy
     services:
@@ -172,8 +173,21 @@ jobs:
           --health-interval=5s
           --health-timeout=5s
           --health-retries=20
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: cleantest
+          POSTGRES_DB: clean_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
     env:
       CLEAN_TEST_MYSQL_URL: mysql://root:cleantest@127.0.0.1:3306/clean_test
+      CLEAN_TEST_PG_URL: postgres://postgres:cleantest@127.0.0.1:5432/clean_test
     steps:
       - uses: actions/checkout@v4
 
@@ -199,6 +213,9 @@ jobs:
 
       - name: MySQL dialect translation + integration tests
         run: cd host-bridge && cargo test --lib mysql_ -- --nocapture
+
+      - name: PostgreSQL RETURNING tests
+        run: cd host-bridge && cargo test --lib postgres_returning -- --nocapture
 
   # ---------------------------------------------------------------
   # T2 · Integration tests that read files from monorepo siblings.

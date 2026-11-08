@@ -195,6 +195,15 @@ pub(crate) fn translate(sql: &str, param_count: usize) -> Result<Vec<Statement>,
     Ok(statements)
 }
 
+/// Whether `sql` ends in a `RETURNING` clause at the top level (outside
+/// quotes, comments and parentheses) — a write that answers rows. The
+/// lexer is MySQL's, but the answer is the same for PostgreSQL SQL.
+pub(crate) fn has_returning_clause(sql: &str) -> bool {
+    significant(&lex(sql))
+        .iter()
+        .any(|(t, depth)| *depth == 0 && t.is_kw("RETURNING"))
+}
+
 // ============================================================================
 // Lexer
 // ============================================================================
@@ -1551,6 +1560,21 @@ mod tests {
                 },
             ])
         );
+    }
+
+    #[test]
+    fn returning_clauses_are_found_at_the_top_level_only() {
+        assert!(has_returning_clause(
+            "INSERT INTO t (a) VALUES ($1) RETURNING id"
+        ));
+        assert!(has_returning_clause("update t set a = 1 returning *"));
+        assert!(!has_returning_clause(
+            "INSERT INTO t (a) VALUES ('RETURNING id')"
+        ));
+        assert!(!has_returning_clause("SELECT returning_id FROM t"));
+        assert!(!has_returning_clause(
+            "WITH m AS (DELETE FROM t RETURNING *) SELECT 1"
+        ));
     }
 
     #[test]

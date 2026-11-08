@@ -321,6 +321,21 @@ impl DatabaseDriver {
             query = Self::bind_param_postgres(query, param);
         }
 
+        // `INSERT ... RETURNING id` (frame.data's save() of a new row)
+        // answers the rows; PostgreSQL has no last-insert id otherwise.
+        if mysql_sql::has_returning_clause(sql) {
+            let rows = query.fetch_all(executor).await?;
+            let rows = rows
+                .iter()
+                .map(Self::row_to_json_postgres)
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(ExecuteResult {
+                rows_affected: rows.len() as u64,
+                last_insert_id: None,
+                rows: Some(rows),
+            });
+        }
+
         let result = query.execute(executor).await?;
 
         Ok(ExecuteResult {
@@ -5120,6 +5135,78 @@ mod integration_tests {
 /// `CLEAN_TEST_MYSQL_URL` names a database the tests may create tables in,
 /// e.g. `mysql://root:pass@127.0.0.1:3306/clean_test`; skipped otherwise.
 /// Every test uses its own tables, so they can share one database.
+/// `INSERT ... RETURNING` on PostgreSQL answers its rows, as on MySQL.
+/// Runs when `CLEAN_TEST_PG_URL` names a database the test may create a
+/// table in; skipped otherwise.
+#[cfg(test)]
+mod postgres_returning_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn insert_returning_answers_the_new_row() {
+        let Ok(url) = std::env::var("CLEAN_TEST_PG_URL") else {
+            return;
+        };
+        let mut db = DbBridge::new();
+        db.configure(DbConfig {
+            database_url: url,
+            max_connections: 2,
+            min_connections: 1,
+            connection_timeout: 10000,
+            query_timeout: 30000,
+        })
+        .await
+        .expect("CLEAN_TEST_PG_URL must name a reachable PostgreSQL database");
+        let run = |sql: &str, params: Value| json!({"sql": sql, "params": params});
+        db.call(
+            "execute",
+            run("DROP TABLE IF EXISTS pg_returning", json!([])),
+        )
+        .await
+        .unwrap();
+        let r = db
+            .call(
+                "execute",
+                run(
+                    "CREATE TABLE pg_returning (id SERIAL PRIMARY KEY, name TEXT NOT NULL)",
+                    json!([]),
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], true, "{:?}", r);
+        for expected in [1, 2] {
+            let r = db
+                .call(
+                    "execute",
+                    run(
+                        "INSERT INTO pg_returning (name) VALUES ($1) RETURNING id, name",
+                        json!(["n"]),
+                    ),
+                )
+                .await
+                .unwrap();
+            assert_eq!(r["ok"], true, "{:?}", r);
+            assert_eq!(r["data"]["affected_rows"], 1);
+            assert_eq!(r["data"]["count"], 1);
+            assert_eq!(r["data"]["rows"][0]["id"], expected);
+            assert_eq!(r["data"]["rows"][0]["name"], "n");
+        }
+        let r = db
+            .call(
+                "execute",
+                run("UPDATE pg_returning SET name = $1", json!(["m"])),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r["data"]["affected_rows"], 2);
+        assert!(r["data"].get("rows").is_none());
+        db.call("execute", run("DROP TABLE pg_returning", json!([])))
+            .await
+            .unwrap();
+    }
+}
+
 #[cfg(test)]
 mod mysql_dialect_tests {
     use super::*;
