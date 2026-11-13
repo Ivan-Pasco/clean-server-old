@@ -1197,3 +1197,21 @@ async fn test_split_empty_delimiter_gives_one_element_per_byte() {
         "split(\"\") output"
     );
 }
+
+#[tokio::test]
+async fn test_print_writes_each_byte_of_a_multibyte_character() {
+    // Issue #4: iterating "héllo" yields one-byte strings, two of them the
+    // halves of "é"; print writes each byte unchanged with its newline.
+    let source = "start:\n\
+                  \titerate ch in \"h\u{e9}llo\"\n\
+                  \t\tprint(ch)\n";
+    let out = start_output(source, get_test_port(17)).await;
+    assert_eq!(
+        out,
+        [
+            0x68, 0x0a, 0xc3, 0x0a, 0xa9, 0x0a, 0x6c, 0x0a, 0x6c, 0x0a, 0x6f, 0x0a
+        ],
+        "stdout as text: {:?}",
+        String::from_utf8_lossy(&out)
+    );
+}

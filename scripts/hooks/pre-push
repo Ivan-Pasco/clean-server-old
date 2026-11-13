@@ -31,6 +31,7 @@ INTEGRATION_TESTS=(
   jobs_bridge_test
   page_guard_redirect_test
   string_split_test
+  print_bytes_test
   http_bridge_defaults_test
   jobs_persistence_test
   wasm_alignment_test

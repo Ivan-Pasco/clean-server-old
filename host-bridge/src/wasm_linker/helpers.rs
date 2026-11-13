@@ -123,6 +123,29 @@ pub fn read_string_from_caller<S: WasmStateCore>(
     String::from_utf8(read_string_bytes_from_caller(caller, ptr)?).ok()
 }
 
+/// The bytes at `ptr..ptr + len` in the caller's memory, unchanged.
+///
+/// Errors (so a host function returning it traps) when the module exports no
+/// memory or the range lies outside it. Used by the print functions: a string
+/// is a byte sequence and is written as such, with no UTF-8 check.
+pub fn read_raw_bytes_or_trap<S: WasmStateCore>(
+    caller: &mut Caller<'_, S>,
+    ptr: i32,
+    len: i32,
+) -> anyhow::Result<Vec<u8>> {
+    let memory = caller
+        .get_export("memory")
+        .and_then(|e| e.into_memory())
+        .ok_or_else(|| anyhow::anyhow!("module exports no memory"))?;
+    let start = ptr as u32 as usize;
+    let end = start + len as u32 as usize;
+    memory
+        .data(&*caller)
+        .get(start..end)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| anyhow::anyhow!("string {start}..{end} is out of bounds"))
+}
+
 /// `text.split(delimiter)` on the bytes of the text.
 ///
 /// An empty delimiter gives one part per character, a character being a byte

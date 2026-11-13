@@ -39,6 +39,7 @@ TIER2_FILES=(
   jwt_refresh_rotation_test.rs
   reset_token_bridge_test.rs
   string_split_test.rs
+  print_bytes_test.rs
   page_guard_redirect_test.rs
   http_bridge_defaults_test.rs
   req_body_bytes_bridge_test.rs

@@ -5,11 +5,22 @@
 //!
 //! All functions are generic over `WasmStateCore` to work with any runtime.
 
-use super::helpers::{read_raw_string, read_string_from_caller, write_string_to_caller};
+use super::helpers::{
+    read_raw_bytes_or_trap, read_raw_string, read_string_from_caller, write_string_to_caller,
+};
 use super::state::WasmStateCore;
 use crate::error::BridgeResult;
 use tracing::info;
 use wasmtime::{Caller, Linker};
+
+/// Write `bytes` to stdout unchanged; a failed write traps.
+fn write_stdout(bytes: &[u8]) -> anyhow::Result<()> {
+    use std::io::Write;
+    std::io::stdout()
+        .lock()
+        .write_all(bytes)
+        .map_err(|e| anyhow::anyhow!("writing to stdout failed: {e}"))
+}
 
 /// Register all console/IO functions with the linker
 pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeResult<()> {
@@ -17,36 +28,34 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
     // PRINT FUNCTIONS
     // =========================================
 
-    // print - Print raw bytes without newline
+    // print / print_string (ptr, len): the bytes at ptr..ptr+len written to
+    // stdout unchanged; printl adds a newline. A Clean string is a byte
+    // sequence, so a string holding one byte of a multi-byte UTF-8 character
+    // is written as that byte (no decoding, nothing dropped). A range outside
+    // the module's memory traps.
     linker.func_wrap(
         "env",
         "print",
-        |mut caller: Caller<'_, S>, ptr: i32, len: i32| {
-            if let Some(s) = read_raw_string(&mut caller, ptr, len) {
-                print!("{}", s);
-            }
+        |mut caller: Caller<'_, S>, ptr: i32, len: i32| -> anyhow::Result<()> {
+            write_stdout(&read_raw_bytes_or_trap(&mut caller, ptr, len)?)
         },
     )?;
 
-    // printl - Print raw bytes with newline
     linker.func_wrap(
         "env",
         "printl",
-        |mut caller: Caller<'_, S>, ptr: i32, len: i32| {
-            if let Some(s) = read_raw_string(&mut caller, ptr, len) {
-                println!("{}", s);
-            }
+        |mut caller: Caller<'_, S>, ptr: i32, len: i32| -> anyhow::Result<()> {
+            let mut bytes = read_raw_bytes_or_trap(&mut caller, ptr, len)?;
+            bytes.push(b'\n');
+            write_stdout(&bytes)
         },
     )?;
 
-    // print_string - Print raw string without newline
     linker.func_wrap(
         "env",
         "print_string",
-        |mut caller: Caller<'_, S>, ptr: i32, len: i32| {
-            if let Some(s) = read_raw_string(&mut caller, ptr, len) {
-                print!("{}", s);
-            }
+        |mut caller: Caller<'_, S>, ptr: i32, len: i32| -> anyhow::Result<()> {
+            write_stdout(&read_raw_bytes_or_trap(&mut caller, ptr, len)?)
         },
     )?;
 
