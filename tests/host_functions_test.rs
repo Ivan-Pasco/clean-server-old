@@ -1158,3 +1158,42 @@ functions:
         }
     }
 }
+
+// ============================================================================
+// Strings are bytes: `start:` output from a compiled program, read from the
+// server's stdout.
+// ============================================================================
+
+impl TestServer {
+    /// Everything the server process has written to stdout so far.
+    fn stdout_bytes(&self) -> Vec<u8> {
+        std::fs::read(self._temp_dir.path().join("server.log")).unwrap_or_default()
+    }
+}
+
+/// Compile `source`, start it on the server, and return the bytes `start:`
+/// wrote to stdout. Panics when the program cannot be compiled or served.
+async fn start_output(source: &str, port: u16) -> Vec<u8> {
+    let server = TestServer::new(source, port)
+        .await
+        .unwrap_or_else(|e| panic!("server setup failed: {}", e));
+    server.stdout_bytes()
+}
+
+#[tokio::test]
+async fn test_split_empty_delimiter_gives_one_element_per_byte() {
+    // Issue #3: `"abc".split("")` -> ["a", "b", "c"]; `"".split("")` -> [].
+    let source = "start:\n\
+                  \tlist<string> letters = \"abc\".split(\"\")\n\
+                  \tprint(letters.length())\n\
+                  \tlist<string> nothing = \"\".split(\"\")\n\
+                  \tprint(nothing.length())\n\
+                  \titerate ch in letters\n\
+                  \t\tprint(ch)\n";
+    let out = start_output(source, get_test_port(16)).await;
+    assert_eq!(
+        String::from_utf8_lossy(&out),
+        "3\n0\na\nb\nc\n",
+        "split(\"\") output"
+    );
+}

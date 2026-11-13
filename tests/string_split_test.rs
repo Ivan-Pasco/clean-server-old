@@ -80,6 +80,50 @@ fn read_u32_le(memory: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(memory[offset..offset + 4].try_into().unwrap())
 }
 
+fn read_lp_bytes(memory: &[u8], ptr: usize) -> Vec<u8> {
+    let len = read_u32_le(memory, ptr) as usize;
+    memory[ptr + 4..ptr + 4 + len].to_vec()
+}
+
+/// Run `string.split(text, delim)` against the real server linker and return
+/// the list's elements as byte strings, after checking the list header.
+fn split_via_server(text: &[u8], delim: &[u8]) -> Vec<Vec<u8>> {
+    let engine = Engine::default();
+    let module = Module::new(&engine, SPLIT_DRIVER_WAT).unwrap();
+    let linker = create_linker(&engine).unwrap();
+    let mut store = {
+        let router = Arc::new(Router::new());
+        Store::new(&engine, WasmState::new(router))
+    };
+    let instance = linker.instantiate(&mut store, &module).unwrap();
+    let memory = instance.get_memory(&mut store, "memory").unwrap();
+
+    let (s_ptr, delim_ptr) = {
+        let buf = memory.data_mut(&mut store);
+        let mut p = 16;
+        let s_ptr = p as i32;
+        p = write_lp_bytes(buf, p, text);
+        let delim_ptr = p as i32;
+        let _ = write_lp_bytes(buf, p, delim);
+        (s_ptr, delim_ptr)
+    };
+
+    let do_split = instance
+        .get_typed_func::<(i32, i32), i32>(&mut store, "do_split")
+        .unwrap();
+    let list_ptr = do_split.call(&mut store, (s_ptr, delim_ptr)).unwrap();
+    assert!(list_ptr > 0, "string.split returned {}", list_ptr);
+
+    let buf = memory.data(&store);
+    let off = list_ptr as usize;
+    let length = read_u32_le(buf, off) as usize;
+    assert_eq!(read_u32_le(buf, off + 4) as usize, length, "capacity");
+    assert_eq!(read_u32_le(buf, off + 8), 3, "type_id (3 = string)");
+    (0..length)
+        .map(|i| read_lp_bytes(buf, read_u32_le(buf, off + 16 + i * 4) as usize))
+        .collect()
+}
+
 fn read_lp_string(memory: &[u8], ptr: usize) -> String {
     let len = read_u32_le(memory, ptr) as usize;
     String::from_utf8(memory[ptr + 4..ptr + 4 + len].to_vec())
@@ -89,7 +133,10 @@ fn read_lp_string(memory: &[u8], ptr: usize) -> String {
 /// Write a length-prefixed string at offset `ptr`. Returns the new heap
 /// frontier (8-byte aligned) so the caller can place the next string after it.
 fn write_lp_string(memory: &mut [u8], ptr: usize, s: &str) -> usize {
-    let bytes = s.as_bytes();
+    write_lp_bytes(memory, ptr, s.as_bytes())
+}
+
+fn write_lp_bytes(memory: &mut [u8], ptr: usize, bytes: &[u8]) -> usize {
     memory[ptr..ptr + 4].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
     memory[ptr + 4..ptr + 4 + bytes.len()].copy_from_slice(bytes);
     (ptr + 4 + bytes.len() + 7) & !7
@@ -220,4 +267,33 @@ fn string_split_no_match_returns_single_element_list() {
     assert_eq!(read_u32_le(buf, off), 1);
     let elem_ptr = read_u32_le(buf, off + 16) as usize;
     assert_eq!(read_lp_string(buf, elem_ptr), "no-delim-here");
+}
+
+#[test]
+fn string_split_empty_delimiter_gives_one_element_per_byte() {
+    // `"abc".split("")` -> ["a", "b", "c"] (issue #3).
+    let parts = split_via_server(b"abc", b"");
+    assert_eq!(parts, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+}
+
+#[test]
+fn string_split_empty_text_and_empty_delimiter_gives_empty_list() {
+    // `"".split("")` -> [] (issue #3).
+    assert!(split_via_server(b"", b"").is_empty());
+}
+
+#[test]
+fn string_split_empty_delimiter_splits_multibyte_character_into_bytes() {
+    // A character is a byte: "h\u{e9}" (68 c3 a9) splits into three one-byte
+    // strings, the last two each holding part of the UTF-8 encoding of e-acute.
+    let parts = split_via_server("h\u{e9}".as_bytes(), b"");
+    assert_eq!(parts, vec![vec![0x68], vec![0xC3], vec![0xA9]]);
+}
+
+#[test]
+fn string_split_non_utf8_text_splits_on_bytes() {
+    // A string holding a lone byte of a multi-byte character is a valid
+    // Clean string; splitting it must not drop it.
+    let parts = split_via_server(&[b'a', 0xC3, b',', b'b'], b",");
+    assert_eq!(parts, vec![vec![b'a', 0xC3], vec![b'b']]);
 }

@@ -68,21 +68,23 @@ where
     true
 }
 
-/// Read a Clean Language string from WASM memory
+/// Read the bytes of a Clean Language string from WASM memory
 ///
-/// The string format is: [4-byte little-endian length][UTF-8 bytes]
-pub fn read_string_from_caller<S: WasmStateCore>(
+/// The string format is: [4-byte little-endian length][bytes]. The bytes are
+/// returned unchanged: a Clean string is a byte sequence, so a string holding
+/// part of a multi-byte UTF-8 character is still a valid string.
+pub fn read_string_bytes_from_caller<S: WasmStateCore>(
     caller: &mut Caller<'_, S>,
     ptr: i32,
-) -> Option<String> {
+) -> Option<Vec<u8>> {
     let memory = caller.get_export("memory").and_then(|e| e.into_memory())?;
     let data = memory.data(&*caller);
-    let ptr = ptr as usize;
+    let ptr = ptr as u32 as usize;
 
     // Check bounds for length prefix
     if ptr + STRING_LENGTH_PREFIX_SIZE > data.len() {
         error!(
-            "read_string_from_caller: ptr {} out of bounds (memory size: {})",
+            "read_string_bytes_from_caller: ptr {} out of bounds (memory size: {})",
             ptr,
             data.len()
         );
@@ -99,7 +101,7 @@ pub fn read_string_from_caller<S: WasmStateCore>(
 
     if data_end > data.len() {
         error!(
-            "read_string_from_caller: string data out of bounds: {}..{} (memory size: {})",
+            "read_string_bytes_from_caller: string data out of bounds: {}..{} (memory size: {})",
             data_start,
             data_end,
             data.len()
@@ -107,10 +109,44 @@ pub fn read_string_from_caller<S: WasmStateCore>(
         return None;
     }
 
-    // Read and convert to string
-    std::str::from_utf8(&data[data_start..data_end])
-        .map(|s| s.to_string())
-        .ok()
+    Some(data[data_start..data_end].to_vec())
+}
+
+/// Read a Clean Language string from WASM memory as UTF-8 text
+///
+/// The string format is: [4-byte little-endian length][UTF-8 bytes].
+/// Returns `None` when the range is out of bounds or the bytes are not UTF-8.
+pub fn read_string_from_caller<S: WasmStateCore>(
+    caller: &mut Caller<'_, S>,
+    ptr: i32,
+) -> Option<String> {
+    String::from_utf8(read_string_bytes_from_caller(caller, ptr)?).ok()
+}
+
+/// `text.split(delimiter)` on the bytes of the text.
+///
+/// An empty delimiter gives one part per character, a character being a byte
+/// as `.length()`, `.charAt(i)` and `iterate` count it (stdlib-reference.md
+/// §4); an empty text then gives no parts. A non-empty delimiter splits at
+/// every non-overlapping occurrence, left to right, keeping empty parts.
+pub fn split_bytes<'a>(text: &'a [u8], delimiter: &[u8]) -> Vec<&'a [u8]> {
+    if delimiter.is_empty() {
+        return text.chunks(1).collect();
+    }
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut i = 0;
+    while i + delimiter.len() <= text.len() {
+        if text[i..].starts_with(delimiter) {
+            parts.push(&text[start..i]);
+            i += delimiter.len();
+            start = i;
+        } else {
+            i += 1;
+        }
+    }
+    parts.push(&text[start..]);
+    parts
 }
 
 /// Read a raw string from WASM memory (no length prefix, uses explicit length)
@@ -512,9 +548,12 @@ pub fn write_bytes_to_caller<S: WasmStateCore>(caller: &mut Caller<'_, S>, bytes
 ///   offset 12..16 : padding    (u32 LE, 0)
 ///   offset 16..   : N * 4-byte LE pointers to length-prefixed strings
 ///
-/// Each element is a pointer to a string allocated via `write_string_to_caller`
+/// Each element is a pointer to a string allocated via `write_bytes_to_caller`
 /// (so the strings live in WASM-malloc'd memory just like other host-produced
 /// strings). The list header block is allocated via WASM malloc as well.
+///
+/// Each part is a byte string written unchanged (a part may hold a single
+/// byte of a multi-byte UTF-8 character, e.g. from `split("")`).
 ///
 /// Returns the pointer to the list block, or 0 on failure.
 ///
@@ -525,7 +564,7 @@ pub fn write_bytes_to_caller<S: WasmStateCore>(caller: &mut Caller<'_, S>, bytes
 /// either over-run (wrong count) or WASM-trap. See HOST_BRIDGE_STRING_SPLIT.
 pub fn write_string_list_to_caller<S: WasmStateCore>(
     caller: &mut Caller<'_, S>,
-    parts: &[&str],
+    parts: &[&[u8]],
 ) -> i32 {
     const LIST_HEADER_SIZE: usize = 16;
     const ELEM_PTR_SIZE: usize = 4;
@@ -537,7 +576,7 @@ pub fn write_string_list_to_caller<S: WasmStateCore>(
     // and __heap_ptr stays consistent).
     let mut element_ptrs: Vec<i32> = Vec::with_capacity(num_parts);
     for part in parts {
-        let p = write_string_to_caller(caller, part);
+        let p = write_bytes_to_caller(caller, part);
         if p == 0 {
             error!("write_string_list_to_caller: failed to allocate element string");
             return 0;
@@ -693,5 +732,37 @@ mod tests {
         let data = vec![10, 0, 0, 0]; // length = 10, but no data
         let result = read_length_prefixed_bytes(&data, 0);
         assert!(result.is_empty()); // Should return empty on out of bounds
+    }
+
+    #[test]
+    fn split_bytes_empty_delimiter_gives_one_part_per_byte() {
+        let parts = split_bytes(b"abc", b"");
+        assert_eq!(parts, vec![&b"a"[..], &b"b"[..], &b"c"[..]]);
+    }
+
+    #[test]
+    fn split_bytes_empty_text_and_empty_delimiter_gives_no_parts() {
+        assert!(split_bytes(b"", b"").is_empty());
+    }
+
+    #[test]
+    fn split_bytes_empty_delimiter_splits_multibyte_characters_into_bytes() {
+        // "h\u{e9}" is 3 bytes: 'h', 0xC3, 0xA9
+        let parts = split_bytes("h\u{e9}".as_bytes(), b"");
+        assert_eq!(parts, vec![&b"h"[..], &[0xC3u8][..], &[0xA9u8][..]]);
+    }
+
+    #[test]
+    fn split_bytes_non_empty_delimiter_keeps_empty_parts() {
+        assert_eq!(
+            split_bytes(b",a,,b,", b","),
+            vec![&b""[..], &b"a"[..], &b""[..], &b"b"[..], &b""[..]]
+        );
+        assert_eq!(
+            split_bytes(b"a```b```c", b"```"),
+            vec![&b"a"[..], &b"b"[..], &b"c"[..]]
+        );
+        assert_eq!(split_bytes(b"", b","), vec![&b""[..]]);
+        assert_eq!(split_bytes(b"abc", b"x"), vec![&b"abc"[..]]);
     }
 }

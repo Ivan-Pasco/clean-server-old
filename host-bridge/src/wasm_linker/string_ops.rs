@@ -11,11 +11,22 @@
 //! All functions are generic over `WasmStateCore` to work with any runtime.
 
 use super::helpers::{
-    read_raw_string, read_string_from_caller, write_string_list_to_caller, write_string_to_caller,
+    read_raw_string, read_string_bytes_from_caller, read_string_from_caller, split_bytes,
+    write_string_list_to_caller, write_string_to_caller,
 };
 use super::state::WasmStateCore;
 use crate::error::BridgeResult;
 use wasmtime::{Caller, Linker};
+
+/// `text.split(delimiter)` for the `string_split` / `string.split` imports:
+/// both arguments are length-prefixed strings read as bytes, the parts are
+/// written back as a `list<string>`.
+fn string_split<S: WasmStateCore>(caller: &mut Caller<'_, S>, ptr: i32, delim_ptr: i32) -> i32 {
+    let text = read_string_bytes_from_caller(caller, ptr).unwrap_or_default();
+    let delimiter = read_string_bytes_from_caller(caller, delim_ptr).unwrap_or_default();
+    let parts = split_bytes(&text, &delimiter);
+    write_string_list_to_caller(caller, &parts)
+}
 
 /// Validate a string against a compile-time integer pattern ID.
 /// IDs: 0=email 1=url 2=uuid 3=phone 4=date 5=integer 6=number 7=alphanumeric
@@ -300,16 +311,15 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
     // pointer (16-byte header + N*4-byte element pointers). See
     // `write_string_list_to_caller` for the layout. Returning a JSON-encoded
     // length-prefixed string here would break `iterate` (HOST_BRIDGE_STRING_SPLIT).
+    //
+    // The split works on the raw bytes (`split_bytes`): an empty delimiter
+    // gives one element per byte, and `"".split("")` gives an empty list.
     // Signature: (ptr: i32, delim_ptr: i32) -> i32
     linker.func_wrap(
         "env",
         "string_split",
         |mut caller: Caller<'_, S>, ptr: i32, delim_ptr: i32| -> i32 {
-            let s = read_string_from_caller(&mut caller, ptr).unwrap_or_default();
-            let delim = read_string_from_caller(&mut caller, delim_ptr).unwrap_or_default();
-
-            let parts: Vec<&str> = s.split(delim.as_str()).collect();
-            write_string_list_to_caller(&mut caller, &parts)
+            string_split(&mut caller, ptr, delim_ptr)
         },
     )?;
 
@@ -317,11 +327,7 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
         "env",
         "string.split",
         |mut caller: Caller<'_, S>, ptr: i32, delim_ptr: i32| -> i32 {
-            let s = read_string_from_caller(&mut caller, ptr).unwrap_or_default();
-            let delim = read_string_from_caller(&mut caller, delim_ptr).unwrap_or_default();
-
-            let parts: Vec<&str> = s.split(delim.as_str()).collect();
-            write_string_list_to_caller(&mut caller, &parts)
+            string_split(&mut caller, ptr, delim_ptr)
         },
     )?;
 
