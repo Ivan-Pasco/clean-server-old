@@ -477,10 +477,10 @@ jobs:
         run: |
           set -e
           mkdir -p "$HOME/.cleen/bin"
-          tag="$(gh release view --repo Ivan-Pasco/clean-language-compiler --json tagName -q .tagName)"
+          tag="$(gh release view --repo Ivan-Pasco/clean-language-compiler-old --json tagName -q .tagName)"
           echo "Fetching cln from compiler release: $tag"
           if gh release download "$tag" \
-              --repo Ivan-Pasco/clean-language-compiler \
+              --repo Ivan-Pasco/clean-language-compiler-old \
               --pattern 'cln-linux*' \
               --clobber -D "$HOME/.cleen/bin" 2>/dev/null; then
             # Unpack whichever archive format shipped.
