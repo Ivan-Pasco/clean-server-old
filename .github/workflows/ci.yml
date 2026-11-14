@@ -147,8 +147,10 @@ jobs:
           key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-integration-
 
+      # Tests named `*_with_cln` need the cln compiler; they run in the
+      # e2e job, which installs it.
       - name: cargo test --test ${{ matrix.test }}
-        run: cargo test --test ${{ matrix.test }}
+        run: cargo test --test ${{ matrix.test }} -- --skip _with_cln
 
   # ---------------------------------------------------------------
   # T2 · MySQL 8 — frame.data's SQL translated for MySQL (host-bridge
@@ -466,44 +468,27 @@ jobs:
       - name: server_smoke_test (no external compiler)
         run: cargo test --test server_smoke_test -- --nocapture
 
-      # host_functions_test requires the `cln` compiler. It's kept as a
-      # separate step so its absence produces a clear skip rather than a
-      # confusing linker error mixed with the smoke test.
-      - name: Install cln compiler for HTTP E2E suite
-        id: install_cln
-        continue-on-error: true
+      # host_functions_test and the `*_with_cln` tests need the `cln`
+      # compiler. Installing it is part of the job: if it fails, the job
+      # fails — the HTTP suite is never skipped.
+      - name: Install cln compiler (old toolchain)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -e
+          set -euo pipefail
           mkdir -p "$HOME/.cleen/bin"
           tag="$(gh release view --repo Ivan-Pasco/clean-language-compiler-old --json tagName -q .tagName)"
           echo "Fetching cln from compiler release: $tag"
-          if gh release download "$tag" \
-              --repo Ivan-Pasco/clean-language-compiler-old \
-              --pattern 'cln-linux*' \
-              --clobber -D "$HOME/.cleen/bin" 2>/dev/null; then
-            # Unpack whichever archive format shipped.
-            (cd "$HOME/.cleen/bin" && for f in *.tar.gz *.tgz; do [ -e "$f" ] && tar -xzf "$f"; done)
-            (cd "$HOME/.cleen/bin" && for f in *.zip; do [ -e "$f" ] && unzip -o "$f"; done)
-            # Ensure the binary is named `cln` and executable.
-            if [[ ! -x "$HOME/.cleen/bin/cln" ]]; then
-              find "$HOME/.cleen/bin" -maxdepth 3 -type f -name 'cln' -exec cp {} "$HOME/.cleen/bin/cln" \;
-            fi
-            chmod +x "$HOME/.cleen/bin/cln" || true
-            "$HOME/.cleen/bin/cln" --version && echo "cln_available=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "cln compiler not available on release — skipping HTTP E2E suite."
-            echo "cln_available=false" >> "$GITHUB_OUTPUT"
-          fi
+          gh release download "$tag" \
+            --repo Ivan-Pasco/clean-language-compiler-old \
+            --pattern 'cln-linux-x86_64.tar.gz' \
+            --clobber -D "$RUNNER_TEMP"
+          tar -xzf "$RUNNER_TEMP/cln-linux-x86_64.tar.gz" -C "$HOME/.cleen/bin" ./cln
+          chmod +x "$HOME/.cleen/bin/cln"
+          "$HOME/.cleen/bin/cln" --version
 
       - name: host_functions_test (HTTP E2E)
-        if: steps.install_cln.outputs.cln_available == 'true'
         run: cargo test --test host_functions_test
 
-      - name: HTTP E2E skipped (no cln binary available on latest release)
-        if: steps.install_cln.outputs.cln_available != 'true'
-        run: |
-          echo "::warning::host_functions_test skipped because the cln compiler binary was not \
-                published under a recognised name in the latest compiler release. See \
-                system-documents/TEST_STRATEGY.md § 3.3."
+      - name: wasm_alignment_test (compiled programs)
+        run: cargo test --test wasm_alignment_test _with_cln

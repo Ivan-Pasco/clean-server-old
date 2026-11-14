@@ -41,7 +41,8 @@ INTEGRATION_TESTS=(
 
 for t in "${INTEGRATION_TESTS[@]}"; do
   echo "  → $t"
-  cargo test --test "$t" --quiet
+  # `*_with_cln` tests need the cln compiler; they are T3 (CI e2e job).
+  cargo test --test "$t" --quiet -- --skip _with_cln
 done
 
 echo "[pre-push] PASSED"
