@@ -17,9 +17,10 @@
 //!
 //! See system-documents/TEST_STRATEGY.md § 4.
 
-use std::collections::BTreeSet;
+mod common;
+
+use common::{SERVER_START_TIMEOUT, pick_port, wait_for_server};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// A minimal Clean-shaped WASM: exports `memory`, `__heap_ptr` (global i32
@@ -35,81 +36,10 @@ const NOOP_WAT: &str = r#"
 )
 "#;
 
-fn locate_server_binary() -> Option<std::path::PathBuf> {
-    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    for candidate in ["target/release/clean-server", "target/debug/clean-server"] {
-        let p = manifest_dir.join(candidate);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
-}
-
-/// Pick a free port that no other test in this binary has been given.
-///
-/// `portpicker` only checks that a port is free at the moment of the call;
-/// it does not reserve it. The tests here run in parallel, so two of them
-/// could draw the same port: one test's readiness probe then connects to the
-/// other test's server, which is killed moments later, and the HTTP request
-/// fails ("error sending request") before this test's own server has even
-/// bound. Ports are therefore handed out at most once per process.
-fn pick_port() -> u16 {
-    static TAKEN: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
-    loop {
-        let port =
-            portpicker::pick_unused_port().expect("no free TCP port available for smoke test");
-        if TAKEN.lock().expect("port registry poisoned").insert(port) {
-            return port;
-        }
-    }
-}
-
-/// Wait until `child` — and not some other process — serves `port`.
-///
-/// A successful TCP connect alone does not prove readiness: the port could
-/// belong to someone else. The server logs `Server listening on
-/// http://<addr>` just before it binds, so readiness is that line in *this*
-/// child's stderr, the child still running, and the port accepting
-/// connections.
-fn wait_for_server(
-    child: &mut std::process::Child,
-    port: u16,
-    stderr_log: &std::path::Path,
-    timeout: Duration,
-) -> Result<(), String> {
-    let listening = format!("Server listening on http://127.0.0.1:{port}");
-    let addr = format!("127.0.0.1:{port}").parse().unwrap();
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Ok(Some(status)) = child.try_wait() {
-            return Err(format!("clean-server exited before serving: {status}"));
-        }
-        let logged = std::fs::read_to_string(stderr_log)
-            .map(|log| log.contains(&listening))
-            .unwrap_or(false);
-        if logged && std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok()
-        {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    Err(format!(
-        "clean-server did not serve 127.0.0.1:{port} within {timeout:?}"
-    ))
-}
-
 #[test]
 fn server_boots_serves_and_shuts_down() {
-    let Some(server_bin) = locate_server_binary() else {
-        // Fail rather than silently skip: the strategy doc says this test
-        // must run in T3 CI, and CI always has a build. A missing binary
-        // locally means the developer forgot to `cargo build` — surface it.
-        panic!(
-            "server_smoke_test: clean-server binary not found under target/. \
-             Run `cargo build` before invoking this test."
-        );
-    };
+    // The binary Cargo built for this test run (never a stale release build).
+    let server_bin = env!("CARGO_BIN_EXE_clean-server");
 
     // Compile the no-op WAT to a temp .wasm file.
     let wasm_bytes = wat::parse_str(NOOP_WAT).expect("no-op WAT should compile");
@@ -123,7 +53,7 @@ fn server_boots_serves_and_shuts_down() {
     // failure without polluting normal test output.
     let stdout_log = temp.path().join("server.out");
     let stderr_log = temp.path().join("server.err");
-    let mut child = Command::new(&server_bin)
+    let mut child = Command::new(server_bin)
         .arg(&wasm_path)
         .args(["--port", &port.to_string(), "--host", "127.0.0.1"])
         .stdout(Stdio::from(
@@ -136,7 +66,7 @@ fn server_boots_serves_and_shuts_down() {
         .expect("spawn clean-server");
 
     // Wait until this server (not just any process on the port) is serving.
-    if let Err(why) = wait_for_server(&mut child, port, &stderr_log, Duration::from_secs(15)) {
+    if let Err(why) = wait_for_server(&mut child, port, &stderr_log, SERVER_START_TIMEOUT) {
         let _ = child.kill();
         let _ = child.wait();
         let out = std::fs::read_to_string(&stdout_log).unwrap_or_default();
@@ -255,7 +185,7 @@ fn module_declared_port_is_bound_without_cli_port() {
         &mut child,
         port,
         &temp.path().join("server.err"),
-        Duration::from_secs(15),
+        SERVER_START_TIMEOUT,
     );
     let (out, err) = stop(child, temp.path());
     assert!(
@@ -278,7 +208,7 @@ fn explicit_cli_port_wins_over_module_port() {
         &mut child,
         cli_port,
         &temp.path().join("server.err"),
-        Duration::from_secs(15),
+        SERVER_START_TIMEOUT,
     );
     let (out, err) = stop(child, temp.path());
     assert!(
@@ -303,7 +233,7 @@ fn server_logs_go_to_stderr_not_stdout() {
         &mut child,
         port,
         &temp.path().join("server.err"),
-        Duration::from_secs(15),
+        SERVER_START_TIMEOUT,
     );
     let (out, err) = stop(child, temp.path());
     assert!(

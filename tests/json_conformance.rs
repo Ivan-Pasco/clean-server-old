@@ -16,7 +16,7 @@
 //! i_* deltas print a warning only.
 //!
 //! The corpus is imported as a git submodule. If the submodule is absent
-//! (e.g. shallow CI checkout), the test skips cleanly with a warning so it
+//! (e.g. a checkout without `submodules: recursive`), the test fails, so it
 //! never masquerades as a green run on a workflow that forgot the checkout
 //! flag.
 
@@ -191,15 +191,14 @@ fn category(name: &str) -> Option<char> {
 
 #[test]
 fn json_conformance_baseline_matches() {
-    if !corpus_available() {
-        eprintln!(
-            "::warning::JSONTestSuite corpus not found at {} — skipping conformance test. \
-             Run `git submodule update --init tests/fixtures/JSONTestSuite` or ensure CI \
-             checks out submodules.",
-            corpus_dir().display()
-        );
-        return;
-    }
+    // A missing corpus is a failure, not a skip: without it this test would
+    // pass having checked nothing. CI checks the submodule out.
+    assert!(
+        corpus_available(),
+        "JSONTestSuite corpus not found at {}. Run \
+         `git submodule update --init tests/fixtures/JSONTestSuite`.",
+        corpus_dir().display()
+    );
 
     let results = run_corpus();
     let baseline = read_baseline();

@@ -10,18 +10,24 @@
 //!
 //! # Tests
 //!
-//! 1. `test_instantiate_example_wasm_binaries` — scans examples/ for .wasm
-//!    files and attempts instantiation against the full server linker.
-//! 2. `test_compile_and_instantiate` — compiles a minimal Clean Language
-//!    source and instantiates the result (skipped if compiler unavailable).
+//! 1. `test_examples_compile_and_instantiate_with_cln` — compiles every
+//!    examples/**/*.cln and instantiates it against the full server linker.
+//! 2. `test_compile_and_instantiate_with_cln` — compiles a minimal Clean
+//!    Language source and instantiates the result.
+//!
+//! Tests 1 and 2 need the `cln` compiler (`~/.cleen/bin/cln`) and fail
+//! without it. CI runs them in the e2e job, which installs the compiler, and
+//! skips them (`--skip _with_cln`) in the integration job, which does not.
 //! 3. `test_linker_provides_all_standard_imports` — a static WAT contract
 //!    listing every import the current compiler is known to generate.
+
+mod common;
 
 use clean_server::bridge::create_linker;
 use clean_server::router::Router;
 use clean_server::wasm::WasmState;
+use common::compile_cln;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 use wasmtime::{Engine, Module, Store};
 
@@ -76,74 +82,57 @@ fn try_instantiate_wasm_file(engine: &Engine, wasm_path: &std::path::Path) -> Re
 }
 
 // ---------------------------------------------------------------------------
-// Test 1: Instantiate all .wasm binaries found under examples/
+// Test 1: Compile every example under examples/ and instantiate it.
+//
+// The examples are the programs users copy from, so each must still compile
+// with the current compiler and load on this server.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_instantiate_example_wasm_binaries() {
+fn test_examples_compile_and_instantiate_with_cln() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let examples_dir = manifest_dir.join("examples");
 
-    // Collect all .wasm files under examples/ recursively.
-    let wasm_files = collect_wasm_files(&examples_dir);
-
-    if wasm_files.is_empty() {
-        eprintln!(
-            "test_instantiate_example_wasm_binaries: No .wasm files found under {}. \
-             Skipping — compile some examples first with `cln compile`.",
-            examples_dir.display()
-        );
-        return; // Not a failure: no binaries to test.
-    }
-
-    eprintln!(
-        "test_instantiate_example_wasm_binaries: Found {} .wasm file(s) to test.",
-        wasm_files.len()
+    let sources = collect_files(&examples_dir, "cln");
+    assert!(
+        !sources.is_empty(),
+        "no .cln examples found under {}",
+        examples_dir.display()
     );
 
     let engine = Engine::default();
+    let temp_dir = tempfile::TempDir::new().expect("Failed to create temp directory");
     let mut failures: Vec<String> = Vec::new();
 
-    for wasm_path in &wasm_files {
-        eprintln!("  Testing: {}", wasm_path.display());
-        match try_instantiate_wasm_file(&engine, wasm_path) {
-            Ok(()) => eprintln!("    PASS"),
-            Err(msg) => {
-                eprintln!("    FAIL: {}", msg);
-                failures.push(msg);
-            }
+    for (index, source_path) in sources.iter().enumerate() {
+        let wasm_path = temp_dir.path().join(format!("example_{index}.wasm"));
+        let result = compile_cln(source_path, &wasm_path, &[])
+            .and_then(|()| try_instantiate_wasm_file(&engine, &wasm_path));
+        if let Err(msg) = result {
+            failures.push(format!("{}:\n{}", source_path.display(), msg));
         }
     }
 
-    if !failures.is_empty() {
-        panic!(
-            "{} of {} .wasm file(s) failed instantiation:\n\n{}",
-            failures.len(),
-            wasm_files.len(),
-            failures.join("\n\n---\n\n")
-        );
-    }
-
-    eprintln!(
-        "test_instantiate_example_wasm_binaries: All {} file(s) instantiated successfully.",
-        wasm_files.len()
+    assert!(
+        failures.is_empty(),
+        "{} of {} example(s) failed to compile or instantiate:\n\n{}",
+        failures.len(),
+        sources.len(),
+        failures.join("\n\n---\n\n")
     );
 }
 
-/// Recursively collect all *.wasm files under `dir`.
-fn collect_wasm_files(dir: &std::path::Path) -> Vec<PathBuf> {
+/// Recursively collect all files with extension `ext` under `dir`.
+fn collect_files(dir: &std::path::Path, ext: &str) -> Vec<PathBuf> {
     let mut result = Vec::new();
-    if !dir.exists() {
-        return result;
-    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return result;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            result.extend(collect_wasm_files(&path));
-        } else if path.extension().and_then(|e| e.to_str()) == Some("wasm") {
+            result.extend(collect_files(&path, ext));
+        } else if path.extension().and_then(|e| e.to_str()) == Some(ext) {
             result.push(path);
         }
     }
@@ -156,154 +145,44 @@ fn collect_wasm_files(dir: &std::path::Path) -> Vec<PathBuf> {
 //
 // This is the highest-fidelity test: it uses the actual compiler to produce
 // a binary and immediately checks that the server linker can satisfy all of
-// its imports.  The test is skipped gracefully when the `cln` compiler is not
-// installed, so CI environments without a compiler binary still pass.
+// its imports. It needs `~/.cleen/bin/cln`; CI runs the `_with_cln` tests in
+// the e2e job, which installs the compiler.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_compile_and_instantiate() {
-    let cln_path = match find_cln_compiler() {
-        Some(p) => p,
-        None => {
-            eprintln!(
-                "test_compile_and_instantiate: cln compiler not found. \
-                 Install via `cleen install latest` or add to PATH. Skipping."
-            );
-            return; // Graceful skip — not a failure.
-        }
-    };
-
-    // Candidate sources in preference order. The Clean Language syntax for
-    // the entry point has changed between compiler versions:
-    //   - Older versions use `start()` (parentheses, no colon)
-    //   - Newer versions use `start:` (colon, no parentheses)
-    // We try both to remain robust across installed compiler versions.
-    let candidates: &[&str] = &[
-        // Newer compiler syntax (start:)
-        r#"plugins:
-	frame.server
-
-start:
+fn test_compile_and_instantiate_with_cln() {
+    // Changed: one source in the current syntax (`start:` before
+    // `functions:`, `_http_route` naming its handler export) replaces the
+    // list of old/new syntax candidates; the `plugins: frame.server` block is
+    // gone because the calls below are host bridge functions that need no
+    // plugin, and CI has no plugins installed.
+    let source = r#"start:
 	integer status = 0
-	status = _http_route("GET", "/test", 0)
+	status = _http_route("GET", "/test", "__route_handler_0")
 	integer listenStatus = _http_listen(3000)
 
 functions:
 	string __route_handler_0()
 		return _req_body()
-"#,
-        // Older compiler syntax (start())
-        r#"plugins:
-	frame.server
-
-functions:
-	string __route_handler_0()
-		return _req_body()
-
-start()
-	integer status = 0
-	status = _http_route("GET", "/test", 0)
-	integer listenStatus = _http_listen(3000)
-"#,
-    ];
+"#;
 
     let temp_dir = tempfile::TempDir::new().expect("Failed to create temp directory");
     let source_path = temp_dir.path().join("alignment_test.cln");
     let wasm_path = temp_dir.path().join("alignment_test.wasm");
+    std::fs::write(&source_path, source).expect("Failed to write alignment_test.cln");
 
-    let mut compilation_errors: Vec<String> = Vec::new();
-
-    for (attempt, source) in candidates.iter().enumerate() {
-        std::fs::write(&source_path, source)
-            .expect("Failed to write temporary Clean Language source file");
-
-        // Remove any previous .wasm output to avoid stale results.
-        let _ = std::fs::remove_file(&wasm_path);
-
-        let compile_output = Command::new(&cln_path)
-            .args([
-                "compile",
-                "--plugins",
-                source_path.to_str().unwrap(),
-                "-o",
-                wasm_path.to_str().unwrap(),
-            ])
-            .output()
-            .expect("Failed to invoke cln compiler");
-
-        if compile_output.status.success() && wasm_path.exists() {
-            eprintln!(
-                "test_compile_and_instantiate: Compiled successfully using \
-                 candidate syntax {} ({})",
-                attempt + 1,
-                if attempt == 0 { "start:" } else { "start()" }
-            );
-
-            let engine = Engine::default();
-            match try_instantiate_wasm_file(&engine, &wasm_path) {
-                Ok(()) => {
-                    eprintln!(
-                        "test_compile_and_instantiate: PASS — compiled binary \
-                         instantiated successfully."
-                    );
-                    return; // Test passed.
-                }
-                Err(msg) => {
-                    panic!(
-                        "test_compile_and_instantiate: The compiled binary \
-                         could not be instantiated against the server linker.\n\n{}",
-                        msg
-                    );
-                }
-            }
-        }
-
-        let stdout = String::from_utf8_lossy(&compile_output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&compile_output.stderr).to_string();
-        compilation_errors.push(format!(
-            "Candidate {}: stdout: {}\nstderr: {}",
-            attempt + 1,
-            stdout.trim(),
-            stderr.trim()
-        ));
+    if let Err(msg) = compile_cln(&source_path, &wasm_path, &[]) {
+        panic!("test_compile_and_instantiate_with_cln: {msg}");
     }
 
-    // All candidates failed — skip with a diagnostic (not a hard failure)
-    // because this means the installed compiler version uses an unknown syntax.
-    eprintln!(
-        "test_compile_and_instantiate: All {} syntax candidates failed to \
-         compile. This likely means the installed compiler version uses \
-         different syntax than any known variant. Skipping test.\n\n{}",
-        candidates.len(),
-        compilation_errors.join("\n---\n")
-    );
-}
-
-/// Find the `cln` compiler binary.
-///
-/// Resolution order:
-/// 1. `~/.cleen/bin/cln`
-/// 2. `cln` on PATH
-fn find_cln_compiler() -> Option<PathBuf> {
-    // Check the cleen-managed installation first.
-    if let Ok(home) = std::env::var("HOME") {
-        let managed = PathBuf::from(home).join(".cleen/bin/cln");
-        if managed.exists() {
-            return Some(managed);
-        }
+    let engine = Engine::default();
+    if let Err(msg) = try_instantiate_wasm_file(&engine, &wasm_path) {
+        panic!(
+            "test_compile_and_instantiate_with_cln: The compiled binary \
+             could not be instantiated against the server linker.\n\n{}",
+            msg
+        );
     }
-
-    // Fall back to PATH resolution.
-    if let Ok(output) = Command::new("which").arg("cln").output()
-        && output.status.success()
-    {
-        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        if !path.is_empty() {
-            return Some(PathBuf::from(path));
-        }
-    }
-
-    None
 }
 
 // ---------------------------------------------------------------------------

@@ -23,12 +23,8 @@ A simple demonstration of session-based authentication in Clean Language using c
 ## Build & Run
 
 ```bash
-# From the clean-language-compiler directory
-cargo run --bin clean-language-compiler compile \
-  -i ../clean-server/examples/auth-demo/app.cln \
-  -o ../clean-server/examples/auth-demo/app.wasm
-
 # From the clean-server directory
+~/.cleen/bin/cln compile examples/auth-demo/app.cln -o examples/auth-demo/app.wasm
 cargo run --bin clean-server -- examples/auth-demo/app.wasm
 ```
 
