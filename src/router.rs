@@ -280,7 +280,22 @@ impl Router {
                 path: matched.value.path.clone(),
             };
 
-            if let Some(handler) = routes.get(&key) {
+            // HEAD is answered by the GET handler when no explicit HEAD
+            // route exists (RFC 9110 §9.3.2); hyper drops the body.
+            let fallback_key;
+            let handler = match routes.get(&key) {
+                Some(h) => Some(h),
+                None if method == HttpMethod::HEAD => {
+                    fallback_key = RouteKey {
+                        method: HttpMethod::GET,
+                        path: matched.value.path.clone(),
+                    };
+                    routes.get(&fallback_key).filter(|h| !h.is_ws)
+                }
+                None => None,
+            };
+
+            if let Some(handler) = handler {
                 // Extract path parameters
                 let params: HashMap<String, String> = matched
                     .params
@@ -419,6 +434,59 @@ mod tests {
         assert!(router.find(HttpMethod::POST, "/api/users").is_some());
         assert!(router.find(HttpMethod::DELETE, "/api/users").is_none());
         assert!(router.find(HttpMethod::GET, "/not-found").is_none());
+    }
+
+    #[test]
+    fn test_head_falls_back_to_get_handler() {
+        let router = Router::new();
+        router
+            .register(
+                HttpMethod::GET,
+                "/api/health".to_string(),
+                "__route_handler_health".to_string(),
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        router
+            .register(
+                HttpMethod::POST,
+                "/api/submit".to_string(),
+                "__route_handler_submit".to_string(),
+                false,
+                None,
+                false,
+            )
+            .unwrap();
+        router
+            .register_ws("/live".to_string(), "__ws_handler".to_string())
+            .unwrap();
+
+        let (handler, _) = router.find(HttpMethod::HEAD, "/api/health").unwrap();
+        assert_eq!(handler.handler_name, "__route_handler_health");
+        assert!(router.find(HttpMethod::HEAD, "/api/submit").is_none());
+        assert!(router.find(HttpMethod::HEAD, "/live").is_none());
+        assert!(router.find(HttpMethod::HEAD, "/missing").is_none());
+    }
+
+    #[test]
+    fn test_explicit_head_route_wins_over_get() {
+        let router = Router::new();
+        for (method, name) in [(HttpMethod::GET, "__get"), (HttpMethod::HEAD, "__head")] {
+            router
+                .register(
+                    method,
+                    "/x".to_string(),
+                    name.to_string(),
+                    false,
+                    None,
+                    false,
+                )
+                .unwrap();
+        }
+        let (handler, _) = router.find(HttpMethod::HEAD, "/x").unwrap();
+        assert_eq!(handler.handler_name, "__head");
     }
 
     #[test]
