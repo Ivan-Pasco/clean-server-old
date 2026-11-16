@@ -4070,7 +4070,8 @@ fn register_ui_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> {
 /// Replace `{key}` tokens in `template` with values from `data` per the
 /// `_ui_render_page` spec (`HOST_BRIDGE.md` §UI templates). Dotted paths
 /// (`{user.name}`) are looked up against the JSON `data`. Missing paths
-/// produce an empty string. To emit a literal brace in output, escape with
+/// produce an empty string. `{!key}` inserts the value as it is (UI-P007).
+/// To emit a literal brace in output, escape with
 /// `{{` (renders as `{`) or `}}` (renders as `}`). Malformed placeholders
 /// (empty key, newline inside braces) are preserved as literals.
 fn substitute_template(template: &str, data: &serde_json::Value) -> String {
@@ -4108,7 +4109,10 @@ fn substitute_template(template: &str, data: &serde_json::Value) -> String {
                 i += 1;
                 continue;
             }
-            let key = template[body_start..j].trim();
+            let body = template[body_start..j].trim();
+            // `{!key}` inserts the value raw (UI-P007). `{key}` is raw too
+            // for now; see issue #7 for the escaping rollout.
+            let key = body.strip_prefix('!').map_or(body, str::trim_start);
             if key.is_empty() {
                 // `{}` or `{   }` is not a placeholder — preserve literally.
                 result.push_str(&template[i..=j]);
@@ -8011,6 +8015,42 @@ mod tests {
             substitute_template("before {\nbroken} after", &data),
             "before {\nbroken} after"
         );
+    }
+
+    // Regression: issue #7 (UI-P007). `{!key}` inserts the value as it is.
+    // `{key}` stays raw until the site has moved its HTML keys to `{!key}`.
+
+    #[test]
+    fn substitute_template_bang_key_inserts_raw() {
+        let data = serde_json::json!({"msg": "<b>hi</b>", "frag": "<i>ok</i>"});
+        assert_eq!(
+            substitute_template("<p>{msg}</p><div>{!frag}</div>", &data),
+            "<p><b>hi</b></p><div><i>ok</i></div>"
+        );
+    }
+
+    #[test]
+    fn substitute_template_bang_key_dotted_and_spaced() {
+        let data = serde_json::json!({"page": {"nav_html": "<nav>x</nav>"}});
+        assert_eq!(
+            substitute_template(
+                "{!page.nav_html}|{ !page.nav_html }|{! page.nav_html}",
+                &data
+            ),
+            "<nav>x</nav>|<nav>x</nav>|<nav>x</nav>"
+        );
+    }
+
+    #[test]
+    fn substitute_template_bang_key_missing_becomes_empty() {
+        let data = serde_json::json!({});
+        assert_eq!(substitute_template("a{!missing}b", &data), "ab");
+    }
+
+    #[test]
+    fn substitute_template_bare_bang_left_literal() {
+        let data = serde_json::json!({"": "x"});
+        assert_eq!(substitute_template("a{!}b{ ! }c", &data), "a{!}b{ ! }c");
     }
 
     // --- cl-iterate wrapper preservation (RUNTIME-SSR-NEW-DIRECTIVES-NOT-IMPLEMENTED) ---
