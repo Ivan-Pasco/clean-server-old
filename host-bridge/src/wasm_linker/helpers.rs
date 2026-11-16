@@ -172,6 +172,20 @@ pub fn split_bytes<'a>(text: &'a [u8], delimiter: &[u8]) -> Vec<&'a [u8]> {
     parts
 }
 
+/// Shortens `s` to at most `max_bytes` bytes for a log line, adding "..."
+/// when cut. Cuts only on a character boundary: slicing a `&str` inside a
+/// multi-byte character (an em dash, an accented letter) panics.
+pub fn log_preview(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut end = max_bytes;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &s[..end])
+}
+
 /// Read a raw string from WASM memory (no length prefix, uses explicit length)
 pub fn read_raw_string<S: WasmStateCore>(
     caller: &mut Caller<'_, S>,
@@ -207,11 +221,7 @@ pub fn read_raw_string<S: WasmStateCore>(
         Ok(s) => {
             debug!(
                 "read_raw_string: successfully read '{}' ({} bytes)",
-                if s.len() > 100 {
-                    format!("{}...", &s[..100])
-                } else {
-                    s.to_string()
-                },
+                log_preview(s, 100),
                 s.len()
             );
             Some(s.to_string())
@@ -731,6 +741,14 @@ pub fn read_length_prefixed_bytes(data: &[u8], ptr: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_preview_cuts_before_a_multi_byte_character() {
+        // 98 ASCII bytes, then '—' at bytes 98..101: byte 100 is inside it.
+        let s = format!("{}—{}", "a".repeat(98), "b".repeat(50));
+        assert_eq!(log_preview(&s, 100), format!("{}...", "a".repeat(98)));
+        assert_eq!(log_preview(&s, 200), s);
+    }
 
     #[test]
     fn test_read_length_prefixed_bytes() {

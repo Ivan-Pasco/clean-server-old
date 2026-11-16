@@ -15,7 +15,7 @@
 //!
 //! All functions are generic over `WasmStateCore` to work with any runtime.
 
-use super::helpers::{read_raw_string, write_string_to_caller};
+use super::helpers::{log_preview, read_raw_string, write_string_to_caller};
 use super::state::{SharedDbBridge, WasmStateCore};
 use crate::error::BridgeResult;
 use serde_json::{json, Value};
@@ -237,7 +237,7 @@ pub fn register_functions<S: WasmStateCore>(linker: &mut Linker<S>) -> BridgeRes
                 Ok(v) => {
                     let s = v.to_string();
                     debug!("_db_query: Query succeeded, result JSON ({} bytes): {}",
-                           s.len(), if s.len() > 200 { format!("{}...", &s[..200]) } else { s.clone() });
+                           s.len(), log_preview(&s, 200));
                     s
                 }
                 Err(e) => {
