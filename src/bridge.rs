@@ -4070,7 +4070,8 @@ fn register_ui_functions(linker: &mut Linker<WasmState>) -> RuntimeResult<()> {
 /// Replace `{key}` tokens in `template` with values from `data` per the
 /// `_ui_render_page` spec (`HOST_BRIDGE.md` §UI templates). Dotted paths
 /// (`{user.name}`) are looked up against the JSON `data`. Missing paths
-/// produce an empty string. `{!key}` inserts the value as it is (UI-P007).
+/// produce an empty string. `{key}` values are HTML-escaped (UI-P006);
+/// `{!key}` inserts the value as it is (UI-P007).
 /// To emit a literal brace in output, escape with
 /// `{{` (renders as `{`) or `}}` (renders as `}`). Malformed placeholders
 /// (empty key, newline inside braces) are preserved as literals.
@@ -4110,9 +4111,10 @@ fn substitute_template(template: &str, data: &serde_json::Value) -> String {
                 continue;
             }
             let body = template[body_start..j].trim();
-            // `{!key}` inserts the value raw (UI-P007). `{key}` is raw too
-            // for now; see issue #7 for the escaping rollout.
-            let key = body.strip_prefix('!').map_or(body, str::trim_start);
+            let (raw, key) = match body.strip_prefix('!') {
+                Some(rest) => (true, rest.trim_start()),
+                None => (false, body),
+            };
             if key.is_empty() {
                 // `{}` or `{   }` is not a placeholder — preserve literally.
                 result.push_str(&template[i..=j]);
@@ -4122,7 +4124,11 @@ fn substitute_template(template: &str, data: &serde_json::Value) -> String {
             let replacement = lookup_path(data, key)
                 .map(json_value_to_string)
                 .unwrap_or_default();
-            result.push_str(&replacement);
+            if raw {
+                result.push_str(&replacement);
+            } else {
+                push_html_escaped(&mut result, &replacement);
+            }
             i = j + 1;
         } else if c == b'}' && bytes.get(i + 1) == Some(&b'}') {
             // Escape: `}}` → literal `}`
@@ -4141,6 +4147,21 @@ fn substitute_template(template: &str, data: &serde_json::Value) -> String {
         }
     }
     result
+}
+
+/// Append `value` to `out` with `& < > " '` replaced by HTML entities, so a
+/// `{key}` value is always text, both in element content and in attributes.
+fn push_html_escaped(out: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
 }
 
 /// Look up a dot-separated path against the data. Returns None when any path
@@ -8017,15 +8038,60 @@ mod tests {
         );
     }
 
-    // Regression: issue #7 (UI-P007). `{!key}` inserts the value as it is.
-    // `{key}` stays raw until the site has moved its HTML keys to `{!key}`.
+    // Regression: issue #7 (UI-P006/UI-P007). `{key}` is HTML-escaped;
+    // `{!key}` inserts the value as it is.
+    // Fixed: the step-1 version expected `{msg}` raw; UI-P006 requires escaping.
 
     #[test]
     fn substitute_template_bang_key_inserts_raw() {
         let data = serde_json::json!({"msg": "<b>hi</b>", "frag": "<i>ok</i>"});
         assert_eq!(
             substitute_template("<p>{msg}</p><div>{!frag}</div>", &data),
-            "<p><b>hi</b></p><div><i>ok</i></div>"
+            "<p>&lt;b&gt;hi&lt;/b&gt;</p><div><i>ok</i></div>"
+        );
+    }
+
+    #[test]
+    fn substitute_template_escapes_all_five_characters() {
+        let data = serde_json::json!({"v": "a & b < c > d \" e ' f"});
+        assert_eq!(
+            substitute_template("{v}", &data),
+            "a &amp; b &lt; c &gt; d &quot; e &#39; f"
+        );
+    }
+
+    #[test]
+    fn substitute_template_escapes_inside_attribute() {
+        let data = serde_json::json!({"t": "x\" onmouseover=\"alert(1)"});
+        assert_eq!(
+            substitute_template("<a title=\"{t}\">", &data),
+            "<a title=\"x&quot; onmouseover=&quot;alert(1)\">"
+        );
+    }
+
+    #[test]
+    fn substitute_template_escapes_dotted_and_non_string_values() {
+        let data = serde_json::json!({"u": {"name": "<Ada>"}, "n": 3});
+        assert_eq!(substitute_template("{u.name}|{n}", &data), "&lt;Ada&gt;|3");
+    }
+
+    #[test]
+    fn substitute_template_does_not_escape_template_text() {
+        let data = serde_json::json!({"x": "&"});
+        assert_eq!(
+            substitute_template("<b>&amp; {x}</b>", &data),
+            "<b>&amp; &amp;</b>"
+        );
+    }
+
+    #[test]
+    fn render_pipeline_escapes_iterated_values() {
+        let data = serde_json::json!({"items": ["<i>a</i>"]});
+        let template = r#"<ul><li cl-iterate="x in items">{x}|{!x}</li></ul>"#;
+        let with_directives = process_directives(template, &data);
+        assert_eq!(
+            substitute_template(&with_directives, &data),
+            "<ul><li>&lt;i&gt;a&lt;/i&gt;|<i>a</i></li></ul>"
         );
     }
 
