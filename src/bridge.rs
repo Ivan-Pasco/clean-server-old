@@ -4837,8 +4837,11 @@ fn process_iterate_directive(html: &str, data: &serde_json::Value) -> String {
             let body_with_directives = process_directives(&inner, &scoped);
             let body_substituted = substitute_template(&body_with_directives, &scoped);
 
+            // The body is already filled, but every caller runs one more
+            // substitution pass over this output. Re-escape its braces so
+            // that pass restores them instead of reading item data as keys.
             expanded.push_str(&opening_tag);
-            expanded.push_str(&body_substituted);
+            push_brace_escaped(&mut expanded, &body_substituted);
             expanded.push_str(&closing_tag);
         }
 
@@ -4851,6 +4854,18 @@ fn process_iterate_directive(html: &str, data: &serde_json::Value) -> String {
     }
 
     result
+}
+
+/// Append `text` to `out` with `{` and `}` doubled, so one
+/// `substitute_template` pass turns it back into `text` unchanged.
+fn push_brace_escaped(out: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '{' => out.push_str("{{"),
+            '}' => out.push_str("}}"),
+            _ => out.push(ch),
+        }
+    }
 }
 
 /// Process `cl-if="condition"` / `cl-else` directives.
@@ -8081,6 +8096,54 @@ mod tests {
         assert_eq!(
             substitute_template("<b>&amp; {x}</b>", &data),
             "<b>&amp; &amp;</b>"
+        );
+    }
+
+    // Regression: a value filled inside `cl-iterate` was filled a second time
+    // by the page-wide pass, so braces in item data were read as keys.
+
+    fn render_for_test(template: &str, data: &serde_json::Value) -> String {
+        let with_directives = process_directives(template, data);
+        substitute_template(&with_directives, data)
+    }
+
+    #[test]
+    fn render_pipeline_iterated_value_braces_are_not_refilled() {
+        let data = serde_json::json!({"name": "X", "items": ["fn {name}()"]});
+        assert_eq!(
+            render_for_test(r#"<li cl-iterate="x in items">{x}</li>"#, &data),
+            "<li>fn {name}()</li>"
+        );
+    }
+
+    #[test]
+    fn render_pipeline_iterated_raw_value_keeps_braces() {
+        let data = serde_json::json!({"color": "x", "items": ["<style>a{color:red}</style>"]});
+        assert_eq!(
+            render_for_test(r#"<div cl-iterate="x in items">{!x}</div>"#, &data),
+            "<div><style>a{color:red}</style></div>"
+        );
+    }
+
+    #[test]
+    fn render_pipeline_brace_escape_inside_iterate_body() {
+        let data = serde_json::json!({"a": "X", "items": [1]});
+        assert_eq!(
+            render_for_test(r#"<p cl-iterate="x in items">{{a}} {x}</p>"#, &data),
+            "<p>{a} 1</p>"
+        );
+    }
+
+    #[test]
+    fn render_pipeline_nested_iterate_value_braces_are_not_refilled() {
+        let data = serde_json::json!({
+            "k": "X",
+            "rows": [{"cells": ["{k}", "{{k}}"]}]
+        });
+        let template = r#"<tr cl-iterate="r in rows"><td cl-iterate="c in r.cells">{c}</td></tr>"#;
+        assert_eq!(
+            render_for_test(template, &data),
+            "<tr><td>{k}</td><td>{{k}}</td></tr>"
         );
     }
 
